@@ -72,6 +72,28 @@ trait FPUv2 extends SbtModule
   }
 }
 
+object unfu extends Cross[UNFU](v.chiselCrossVersions.keys.toSeq)
+trait UNFU extends millbuild.common.HasChisel with SbtModule with Cross.Module[String] {
+  def chiselVersion: String = crossValue
+  def scalaVersion = v.scalaVersions(chiselVersion)
+  def chiselIvy = Some(v.chiselCrossVersions(chiselVersion)._1)
+  def chiselPluginIvy = Some(v.chiselCrossVersions(chiselVersion)._2)
+  override def millSourcePath = os.pwd / "dependencies" / "unfu" / "chisel"
+  override def sources = T.sources(millSourcePath / "scala")
+  override def scalacPluginIvyDeps = super.scalacPluginIvyDeps() ++ Agg(chiselPluginIvy.get)
+}
+
+object mmaSim extends Cross[MMASim](v.chiselCrossVersions.keys.toSeq)
+trait MMASim extends millbuild.common.HasChisel with SbtModule with Cross.Module[String] {
+  def chiselVersion: String = crossValue
+  def scalaVersion = v.scalaVersions(chiselVersion)
+  def chiselIvy = Some(v.chiselCrossVersions(chiselVersion)._1)
+  def chiselPluginIvy = Some(v.chiselCrossVersions(chiselVersion)._2)
+  override def millSourcePath = os.pwd / "dependencies" / "mma-sim" / "chisel"
+  override def sources = T.sources(millSourcePath / "scala")
+  override def scalacPluginIvyDeps = super.scalacPluginIvyDeps() ++ Agg(chiselPluginIvy.get)
+}
+
 
 
 object rocketchip extends Cross[RocketChip](v.chiselCrossVersions.keys.toSeq)
@@ -185,9 +207,12 @@ trait Ventus
 
   def hardfloatModule = hardfloat(crossValue)
   def fpuv2Module = fpuv2(crossValue)
+  def unfuModule = unfu(crossValue)
+  def mmaSimModule = mmaSim(crossValue)
   def rocketchipModule = rocketchip(crossValue)
   def inclusivecacheModule = inclusivecache(crossValue)
   def memboxModule = MemboxS(crossValue)
+  def unfuLutPath = (os.pwd / "dependencies" / "unfu" / "lut").toString
   def ivyDeps = super.ivyDeps() ++ Agg(
       ivy"io.circe::circe-core:0.14.6",
       ivy"io.circe::circe-generic:0.14.6",
@@ -195,6 +220,7 @@ trait Ventus
     )
 
   override def forkArgs = Seq("-Xmx32G", "-Xss192m")
+  override def forkEnv = super.forkEnv() ++ Map("LUT_PATH" -> unfuLutPath)
   override def scalacOptions = super.scalacOptions() ++ Seq(
     "-language:reflectiveCalls",
     "-Ymacro-annotations",
@@ -208,6 +234,7 @@ trait Ventus
   // Define tests module
   object tests extends ScalaTests with TestModule.ScalaTest {
     override def forkArgs = Seq("-Xmx32G", "-Xss192m")
+    override def forkEnv = super.forkEnv() ++ Map("LUT_PATH" -> unfuLutPath)
     override def ivyDeps = super.ivyDeps() ++ Agg(
       v.chiselCrossVersions(chiselVersion)._2,
       v.chiselCrossVersions(chiselVersion)._3

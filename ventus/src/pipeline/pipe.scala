@@ -88,10 +88,11 @@ class pipe() extends Module{
   val fpu=Module(new FPUexe(num_thread,num_lane))
   val lsu=Module(new LSUexe)
   val sfu=Module(new SFUexe)
+  val unfu=Module(new UNFUexe)
   val mul=Module(new vMULv2(num_thread,num_lane))
   val tensorcore=Module(new vTCexe)
   val lsu2wb=Module(new LSU2WB)
-  val wb=Module(new Writeback(6,7))
+  val wb=Module(new Writeback(6,8))
 
   val inst_cnt_xv = RegInit(VecInit(0.U(32.W), 0.U(32.W)))
   if(INST_CNT_2){
@@ -291,14 +292,14 @@ class pipe() extends Module{
   // ibuffer2issue模块的IO都是实际发射但尚未执行的指令，在这检查undefined instruction
   when(ibuffer2issue.io.out_x.fire){
     val ctrl = ibuffer2issue.io.out_x.bits
-    assert(ctrl.alu_fn =/= 63.U, 
-           p"UNDEFINED INSTRUCTION @ SM ${sm_id} warp ${Decimal(ctrl.wid)} " + 
+    assert(ctrl.alu_fn =/= 63.U || ctrl.unfu || ctrl.mma,
+           p"UNDEFINED INSTRUCTION @ SM ${sm_id} warp ${Decimal(ctrl.wid)} " +
            p"PC 0x${Hexadecimal(ctrl.pc)}: 0x${Hexadecimal(ctrl.inst)}")
   }
   when(ibuffer2issue.io.out_v.fire){
     val ctrl = ibuffer2issue.io.out_v.bits
-    assert(ctrl.alu_fn =/= 63.U, 
-           p"UNDEFINED INSTRUCTION @ SM ${sm_id} warp ${Decimal(ctrl.wid)} " + 
+    assert(ctrl.alu_fn =/= 63.U || ctrl.unfu || ctrl.mma,
+           p"UNDEFINED INSTRUCTION @ SM ${sm_id} warp ${Decimal(ctrl.wid)} " +
            p"PC 0x${Hexadecimal(ctrl.pc)}: 0x${Hexadecimal(ctrl.inst)}")
   }
 
@@ -400,6 +401,9 @@ class pipe() extends Module{
   issueX.io.out_SIMT.ready := false.B
   issueV.io.out_SFU<>sfu.io.in
   issueX.io.out_SFU.ready := false.B
+  issueV.io.out_UNFU<>unfu.io.in
+  issueX.io.out_UNFU.ready := false.B
+  unfu.io.out_x.ready := false.B
   //simt_stack.io.branch_ctl<>Queue(issue.io.out_SIMT,1,flow = true)
   simt_stack.io.if_mask<>valu.io.out2simt_stack
   simt_stack.io.fetch_ctl<>branch_back.io.in1
@@ -440,9 +444,10 @@ class pipe() extends Module{
   wb.io.in_v(1)<>fpu.io.out_v
   wb.io.in_v(2)<>lsu2wb.io.out_v
   wb.io.in_v(3)<>sfu.io.out_v
-  wb.io.in_v(4)<>mul.io.out_v
-  wb.io.in_v(5)<>tensorcore.io.out_v
-  wb.io.in_v(6)<>csrfile.io.out_v
+  wb.io.in_v(4)<>unfu.io.out_v
+  wb.io.in_v(5)<>mul.io.out_v
+  wb.io.in_v(6)<>tensorcore.io.out_v
+  wb.io.in_v(7)<>csrfile.io.out_v
 
   issue_stall:=(~issueX.io.in.ready).asBool | (~issueV.io.in.ready).asBool//scoreb.io.delay | issue.io.in.ready
 }

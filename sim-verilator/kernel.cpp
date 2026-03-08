@@ -169,7 +169,47 @@ void Kernel::assignMetadata(const std::vector<uint64_t>& metadata, metadata_t& m
     mtd.sgprUsage = metadata[index++];
     mtd.vgprUsage = metadata[index++];
     mtd.pdsBaseAddr = metadata[index++];
-    mtd.num_buffer = metadata[index++];
+
+    // Support both legacy and extended metadata formats.
+    // Legacy format:
+    //   [fixed 13 fields] + num_buffer + buffer_base[] + buffer_size[] + buffer_allocsize[]
+    // Extended format:
+    //   legacy fixed fields + num_thread_global[3] + num_thread_local[3] + threadIdxOffset[3]
+    //   + num_buffer + buffer_base[] + buffer_size[] + buffer_allocsize[]
+    const auto metadata_len = static_cast<int>(metadata.size());
+    bool parsed_extended = false;
+    if (metadata_len >= index + 10) {
+        uint64_t maybe_num_buffer = metadata[index + 9];
+        int expected_extended = 23 + static_cast<int>(3 * maybe_num_buffer);
+        if (expected_extended == metadata_len) {
+            for (int i = 0; i < 3; i++) {
+                mtd.num_thread_global[i] = metadata[index++];
+            }
+            for (int i = 0; i < 3; i++) {
+                mtd.num_thread_local[i] = metadata[index++];
+            }
+            for (int i = 0; i < 3; i++) {
+                mtd.threadIdxOffset[i] = metadata[index++];
+            }
+            mtd.num_buffer = metadata[index++];
+            parsed_extended = true;
+        }
+    }
+
+    if (!parsed_extended) {
+        // Fall back to the legacy flattened launch description.
+        const uint64_t flat_local_threads = mtd.wf_size * mtd.wg_size;
+        mtd.num_thread_local[0] = flat_local_threads;
+        mtd.num_thread_local[1] = 1;
+        mtd.num_thread_local[2] = 1;
+        mtd.num_thread_global[0] = mtd.kernel_size[0] * flat_local_threads;
+        mtd.num_thread_global[1] = mtd.kernel_size[1];
+        mtd.num_thread_global[2] = mtd.kernel_size[2];
+        mtd.threadIdxOffset[0] = 0;
+        mtd.threadIdxOffset[1] = 0;
+        mtd.threadIdxOffset[2] = 0;
+        mtd.num_buffer = metadata[index++];
+    }
 
     mtd.buffer_base = new uint64_t[mtd.num_buffer];
 

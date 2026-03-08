@@ -165,6 +165,46 @@ object IDecode //extends DecodeConstants
  // )
 }
 
+object MMADecode {
+  private val MMAOpcode = "b0001010".U(7.W)
+  def isMma(inst: UInt): Bool = inst(6, 0) === MMAOpcode
+  def shape(inst: UInt): UInt = inst(27, 25)
+  def abtype(inst: UInt): UInt = inst(31, 28)
+  def alayout(inst: UInt): Bool = inst(14)
+  def blayout(inst: UInt): Bool = inst(13)
+  def cdtype(inst: UInt): UInt = inst(12)
+}
+
+object UNFUDecode {
+  val default = List(false.B, 0.U(4.W), 0.U(2.W))
+  val table = Array(
+    VEX2_APPROX_F32      -> List(true.B, 0.U(4.W), 0.U(2.W)),
+    VLG2_APPROX_F32      -> List(true.B, 1.U(4.W), 0.U(2.W)),
+    VRCP_APPROX_F32      -> List(true.B, 2.U(4.W), 0.U(2.W)),
+    VSQRT_APPROX_F32     -> List(true.B, 3.U(4.W), 0.U(2.W)),
+    VRSQRT_APPROX_F32    -> List(true.B, 4.U(4.W), 0.U(2.W)),
+    VSIN_APPROX_F32      -> List(true.B, 5.U(4.W), 0.U(2.W)),
+    VCOS_APPROX_F32      -> List(true.B, 6.U(4.W), 0.U(2.W)),
+    VTANH_APPROX_F32     -> List(true.B, 7.U(4.W), 0.U(2.W)),
+    VGELU_APPROX_F32     -> List(true.B, 8.U(4.W), 0.U(2.W)),
+    VSILU_APPROX_F32     -> List(true.B, 9.U(4.W), 0.U(2.W)),
+    VEX2_APPROX_F16X2    -> List(true.B, 0.U(4.W), 1.U(2.W)),
+    VRCP_APPROX_F16X2    -> List(true.B, 2.U(4.W), 1.U(2.W)),
+    VSQRT_APPROX_F16X2   -> List(true.B, 3.U(4.W), 1.U(2.W)),
+    VRSQRT_APPROX_F16X2  -> List(true.B, 4.U(4.W), 1.U(2.W)),
+    VTANH_APPROX_F16X2   -> List(true.B, 7.U(4.W), 1.U(2.W)),
+    VGELU_APPROX_F16X2   -> List(true.B, 8.U(4.W), 1.U(2.W)),
+    VSILU_APPROX_F16X2   -> List(true.B, 9.U(4.W), 1.U(2.W)),
+    VEX2_APPROX_BF16X2   -> List(true.B, 0.U(4.W), 2.U(2.W)),
+    VRCP_APPROX_BF16X2   -> List(true.B, 2.U(4.W), 2.U(2.W)),
+    VSQRT_APPROX_BF16X2  -> List(true.B, 3.U(4.W), 2.U(2.W)),
+    VRSQRT_APPROX_BF16X2 -> List(true.B, 4.U(4.W), 2.U(2.W)),
+    VTANH_APPROX_BF16X2  -> List(true.B, 7.U(4.W), 2.U(2.W)),
+    VGELU_APPROX_BF16X2  -> List(true.B, 8.U(4.W), 2.U(2.W)),
+    VSILU_APPROX_BF16X2  -> List(true.B, 9.U(4.W), 2.U(2.W))
+  )
+}
+
 object IDecodeLUT_IMF{
   import IDecode._
   val table = Array(
@@ -571,6 +611,10 @@ class InstrDecodeV2 extends Module {
       ))
   })
   (ctrlSignals zip io.control).zipWithIndex.foreach{ case((s, c), i) =>
+    val unfuSignals = ListLookup(io.inst(i), UNFUDecode.default, UNFUDecode.table)
+    val isUnfuInst = unfuSignals(0).asBool
+    val isMmaInst = MMADecode.isMma(io.inst(i))
+    val isVecDecoded = s(0).asBool || isUnfuInst || isMmaInst
     if(MMU_ENABLED) {
       c.asid.get := DontCare
     }
@@ -578,18 +622,19 @@ class InstrDecodeV2 extends Module {
     c.wid := io.wid
     c.pc := io.pc + (i.U << 2.U) // for multi-fetching
     c.mop :=  Mux(c.readmask,3.U(2.W),io.inst(i)(27,26))
-    c.fp := s(1) //fp=1->vFPU
+    c.fp := s(1).asBool && !isUnfuInst //fp=1->vFPU
     c.barrier := s(2) //barrier or endprg->to warp_scheduler
     c.branch := s(3)
     c.simt_stack := s(4)
     c.simt_stack_op := s(5)
     c.csr := s(6)
     c.reverse := s(7) //for some vector inst,change in1 and in2, e.g. subr
-    c.isvec := s(0) //isvec=1->vALU/vFPU
-    c.sel_alu3 := s(8)
-    c.mask := ((~io.inst(i)(25)).asBool | c.alu_fn === pipeline.IDecode.FN_VMERGE) & c.isvec & !c.disable_mask //一旦启用mask就会去读v0，所以必须这么写，避免标量指令也不小心读v0
-    c.sel_alu2 := s(9)
-    c.sel_alu1 := s(10)
+    c.isvec := isVecDecoded //isvec=1->vALU/vFPU
+    c.sel_alu3 := Mux(isMmaInst, IDecode.A3_VRS3, s(8))
+    c.mask := Mux(isMmaInst, false.B,
+      ((~io.inst(i)(25)).asBool | c.alu_fn === pipeline.IDecode.FN_VMERGE) & isVecDecoded & !s(24)) //一旦启用mask就会去读v0，所以必须这么写，避免标量指令也不小心读v0
+    c.sel_alu2 := Mux(isMmaInst, IDecode.A2_VRS2, Mux(isUnfuInst, IDecode.A2_VRS2, s(9)))
+    c.sel_alu1 := Mux(isMmaInst, IDecode.A1_VRS1, Mux(isUnfuInst, IDecode.A1_X, s(10)))
     c.sel_imm := s(11)
     c.mem_whb := s(12)
     c.alu_fn := s(13)
@@ -601,11 +646,20 @@ class InstrDecodeV2 extends Module {
     c.mem_unsigned := s(16)
     c.fence := s(17)
     c.sfu := s(18)
-    c.wvd := s(19)
+    c.unfu := isUnfuInst
+    c.mma := isMmaInst
+    c.unfu_op := unfuSignals(1)
+    c.unfu_mode := unfuSignals(2)
+    c.mma_shape := MMADecode.shape(io.inst(i))
+    c.mma_abtype := MMADecode.abtype(io.inst(i))
+    c.mma_cdtype := MMADecode.cdtype(io.inst(i))
+    c.mma_alayout := MMADecode.alayout(io.inst(i))
+    c.mma_blayout := MMADecode.blayout(io.inst(i))
+    c.wvd := s(19).asBool || isUnfuInst || isMmaInst
     c.readmask := s(20) //read mode is mask - for mask bitwise opcode ; for custom load/store -> addr add type & opc A3_SD type
     c.writemask := 0.U//s(21) //write mode is mask - for mask bitwise opcode// c.writemask := s(21) //write mode is mask - for mask bitwise opcode
     c.wxd := s(22)
-    c.tc := s(23)
+    c.tc := s(23).asBool || isMmaInst
     c.disable_mask := s(24)
     c.custom_signal_0 := s(25)
     c.reg_idx1 := Cat(regextInfo(i).regPrefix(1), io.inst(i)(19, 15))

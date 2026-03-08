@@ -17,12 +17,16 @@ trait HasChisel
 trait VentusModule extends HasChisel {
   def hardfloatModule : ScalaModule
   def fpuv2Module : ScalaModule
+  def unfuModule : ScalaModule
+  def mmaSimModule : ScalaModule
   def rocketchipModule : ScalaModule
   def inclusivecacheModule : ScalaModule
   def memboxModule : ScalaModule
   override def moduleDeps = super.moduleDeps ++ Seq(
     hardfloatModule,
     fpuv2Module,
+    unfuModule,
+    mmaSimModule,
     rocketchipModule,
     inclusivecacheModule,
     memboxModule,

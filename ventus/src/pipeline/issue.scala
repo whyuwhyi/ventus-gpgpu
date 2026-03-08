@@ -45,6 +45,7 @@ class Issue extends Module{
     val out_vFPU=DecoupledIO(new vExeData)
     val out_LSU=DecoupledIO(new vExeData)
     val out_SFU=DecoupledIO(new vExeData)
+    val out_UNFU=DecoupledIO(new vExeData)
     val out_SIMT=DecoupledIO(new simtExeData)
     val out_warpscheduler=DecoupledIO(new warpSchedulerExeData())
     val out_CSR=DecoupledIO(new csrExeData())
@@ -62,6 +63,7 @@ class Issue extends Module{
   io.out_vFPU.bits:=inputBuf.bits
   io.out_MUL.bits:=inputBuf.bits
   io.out_SFU.bits:=inputBuf.bits
+  io.out_UNFU.bits:=inputBuf.bits
   io.out_LSU.bits:=inputBuf.bits
   io.out_TC.bits:=inputBuf.bits
   io.out_SIMT.bits.PC_branch:=inputBuf.bits.in3(0)
@@ -94,10 +96,14 @@ class Issue extends Module{
   io.out_warpscheduler.valid:=false.B
   io.out_CSR.valid:=false.B
   io.out_SFU.valid:=false.B
+  io.out_UNFU.valid:=false.B
   inputBuf.ready:=false.B
   when(inputBuf.bits.ctrl.tc){
     io.out_TC.valid:=inputBuf.valid
     inputBuf.ready:=io.out_TC.ready
+  }.elsewhen(inputBuf.bits.ctrl.unfu){
+    io.out_UNFU.valid:=inputBuf.valid
+    inputBuf.ready:=io.out_UNFU.ready
   }.elsewhen(inputBuf.bits.ctrl.sfu){
     io.out_SFU.valid:=inputBuf.valid
     inputBuf.ready:=io.out_SFU.ready
@@ -175,7 +181,7 @@ class XVDualIssue(num_buffer: Int) extends Module{
     val out = Wire(new Bool)
     // sALU | CSR | warpscheduler
     // vFPU | vSFU | vALU&SIMT | vMUL | vTC | LSU
-    when(in.ctrl.tc || in.ctrl.fp || in.ctrl.mul || in.ctrl.sfu || in.ctrl.mem){
+    when(in.ctrl.tc || in.ctrl.fp || in.ctrl.mul || in.ctrl.sfu || in.ctrl.unfu || in.ctrl.mem){
       out := true.B
     }.elsewhen(in.ctrl.csr.orR || in.ctrl.barrier){
       out := false.B
@@ -210,6 +216,7 @@ class IssueV2 extends Module {
     val out_vFPU = DecoupledIO(new vExeData)
     val out_LSU = DecoupledIO(new vExeData)
     val out_SFU = DecoupledIO(new vExeData)
+    val out_UNFU = DecoupledIO(new vExeData)
     val out_SIMT = DecoupledIO(new simtExeData)
     val out_warpscheduler = DecoupledIO(new warpSchedulerExeData())
     val out_CSR = DecoupledIO(new csrExeData())
@@ -226,6 +233,7 @@ class IssueV2 extends Module {
   val arb_vFPU = Module(new RRArbiter(new vExeData, num_issue))
   val arb_LSU = Module(new RRArbiter(new vExeData, num_issue))
   val arb_SFU = Module(new RRArbiter(new vExeData, num_issue))
+  val arb_UNFU = Module(new RRArbiter(new vExeData, num_issue))
   val arb_warpscheduler = Module(new RRArbiter(new warpSchedulerExeData, num_issue))
   val arb_CSR = Module(new RRArbiter(new csrExeData, num_issue))
   val arb_MUL = Module(new RRArbiter(new vExeData, num_issue))
@@ -238,6 +246,7 @@ class IssueV2 extends Module {
     arb_vFPU.io.in(i).valid := false.B
     arb_LSU.io.in(i).valid := false.B
     arb_SFU.io.in(i).valid := false.B
+    arb_UNFU.io.in(i).valid := false.B
     arb_warpscheduler.io.in(i).valid := false.B
     arb_CSR.io.in(i).valid := false.B
     arb_MUL.io.in(i).valid := false.B
@@ -245,6 +254,9 @@ class IssueV2 extends Module {
     when(inputBuf(i).deq().ctrl.tc){  // TC
       arb_TC.io.in(i).valid := inputBuf(i).valid
       inputBuf(i).ready := arb_TC.io.in(i).ready
+    }.elsewhen(inputBuf(i).deq().ctrl.unfu){ // UNFU
+      arb_UNFU.io.in(i).valid := inputBuf(i).valid
+      inputBuf(i).ready := arb_UNFU.io.in(i).ready
     }.elsewhen(inputBuf(i).deq().ctrl.sfu){ // SFU
       arb_SFU.io.in(i).valid := inputBuf(i).valid
       inputBuf(i).ready := arb_SFU.io.in(i).ready
@@ -272,6 +284,7 @@ class IssueV2 extends Module {
     }
 
     arb_TC.io.in(i).bits := inputBuf(i).bits
+    arb_UNFU.io.in(i).bits := inputBuf(i).bits
     arb_SFU.io.in(i).bits := inputBuf(i).bits
     arb_vFPU.io.in(i).bits := inputBuf(i).bits
     arb_MUL.io.in(i).bits := inputBuf(i).bits
@@ -300,6 +313,7 @@ class IssueV2 extends Module {
     }
   }
   io.out_TC <> arb_TC.io.out
+  io.out_UNFU <> arb_UNFU.io.out
   io.out_SFU <> arb_SFU.io.out
   io.out_vFPU <> arb_vFPU.io.out
   io.out_MUL <> arb_MUL.io.out

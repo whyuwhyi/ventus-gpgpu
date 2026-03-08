@@ -67,7 +67,7 @@ class ibuffer2issue extends Module{
     val out = Wire(new Bool)
     // sALU | CSR | warpscheduler
     // vFPU | vSFU | vALU&SIMT | vMUL | vTC | LSU
-    when(in.tc || in.fp || in.mul || in.sfu || in.mem) {
+    when(in.tc || in.fp || in.mul || in.sfu || in.unfu || in.mem) {
       out := true.B
     }.elsewhen(in.csr.orR || in.barrier) {
       out := false.B

@@ -16,6 +16,7 @@ import chisel3._
 import chisel3.util._
 import top.parameters._
 import IDecode._
+import unfu.{SFU => UNFUModule, SFUInput}
 
 class BranchCtrl extends Bundle{
   val wid=UInt(depth_warp.W)
@@ -942,5 +943,121 @@ class SFUexe extends Module{
 
   io.out_v<>result_v.io.deq
   io.out_x<>result_x.io.deq
+}
+
+class UNFUexe extends Module{
+  val io = IO(new Bundle {
+    val in = Flipped(DecoupledIO(new vExeData()))
+    val out_x = DecoupledIO(new WriteScalarCtrl())
+    val out_v = DecoupledIO(new WriteVecCtrl)
+  })
+
+  val unfu = Seq.fill(num_sfu)(Module(new UNFUModule))
+  val dataBuffer = Queue(io.in, 1)
+  val sIdle :: sBusy :: sFinish :: Nil = Enum(3)
+  val state = RegInit(sIdle)
+  val issueValid = RegInit(false.B)
+  val mask = RegInit(0.U(num_thread.W))
+  val outData = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
+
+  val numGrp = num_thread / num_sfu
+  val maskGrp = Wire(Vec(numGrp, Bool()))
+  maskGrp.zipWithIndex.foreach { case (grpMask, idx) =>
+    grpMask := mask(idx * num_sfu + num_sfu - 1, idx * num_sfu).orR
+  }
+  val grpIdx = PriorityEncoder(maskGrp)
+  val laneData = WireInit(VecInit(Seq.fill(num_sfu)(0.U(xLen.W))))
+  val laneMask = WireInit(VecInit(Seq.fill(num_sfu)(false.B)))
+  for (i <- 0 until numGrp) {
+    when(i.U === grpIdx) {
+      laneData := VecInit(dataBuffer.bits.in2.slice(i * num_sfu, i * num_sfu + num_sfu))
+      laneMask := mask(i * num_sfu + num_sfu - 1, i * num_sfu).asBools
+    }
+  }
+
+  val laneInReady = Wire(Vec(num_sfu, Bool()))
+  val laneOutValid = Wire(Vec(num_sfu, Bool()))
+  for (i <- 0 until num_sfu) {
+    unfu(i).io.in.bits.x := laneData(i)
+    unfu(i).io.in.bits.op := dataBuffer.bits.ctrl.unfu_op
+    unfu(i).io.in.bits.mode := dataBuffer.bits.ctrl.unfu_mode
+    laneInReady(i) := !laneMask(i) || unfu(i).io.in.ready
+    laneOutValid(i) := !laneMask(i) || unfu(i).io.out.valid
+    unfu(i).io.in.valid := false.B
+    unfu(i).io.out.ready := false.B
+  }
+
+  val allInReady = laneInReady.asUInt.andR
+  val allOutValid = laneOutValid.asUInt.andR
+  val issueFire = state === sBusy && issueValid && allInReady
+  val collectFire = state === sBusy && !issueValid && allOutValid
+
+  for (i <- 0 until num_sfu) {
+    unfu(i).io.in.valid := issueFire && laneMask(i)
+    unfu(i).io.out.ready := collectFire && laneMask(i)
+  }
+
+  dataBuffer.ready := state === sFinish && io.out_v.ready
+
+  io.out_x.valid := false.B
+  io.out_x.bits := 0.U.asTypeOf(new WriteScalarCtrl)
+
+  io.out_v.bits.wvd_mask := dataBuffer.bits.mask
+  io.out_v.bits.wvd := dataBuffer.bits.ctrl.wvd
+  io.out_v.bits.wb_wvd_rd := outData
+  io.out_v.bits.reg_idxw := dataBuffer.bits.ctrl.reg_idxw
+  io.out_v.bits.warp_id := dataBuffer.bits.ctrl.wid
+  if (SPIKE_OUTPUT) {
+    io.out_v.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
+    io.out_x.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
+  }
+  io.out_v.valid := state === sFinish
+
+  switch(state) {
+    is(sIdle) {
+      when(io.in.fire) {
+        mask := io.in.bits.mask.asUInt
+        when(io.in.bits.mask.asUInt.orR) {
+          state := sBusy
+          issueValid := true.B
+        }.otherwise {
+          state := sFinish
+          issueValid := false.B
+        }
+      }
+    }
+    is(sBusy) {
+      when(issueFire) {
+        issueValid := false.B
+      }
+      when(collectFire) {
+        for (i <- 0 until numGrp) {
+          when(i.U === grpIdx) {
+            val issuedMask = (laneMask.asUInt << (i * num_sfu)).pad(num_thread)
+            val nextMask = mask & (~issuedMask).asUInt
+            mask := nextMask
+            for (j <- 0 until num_sfu) {
+              when(laneMask(j)) {
+                outData(i * num_sfu + j) := unfu(j).io.out.bits.result
+              }
+            }
+            when(nextMask.orR) {
+              issueValid := true.B
+            }.otherwise {
+              state := sFinish
+            }
+          }
+        }
+      }
+    }
+    is(sFinish) {
+      when(io.out_v.ready) {
+        state := sIdle
+        issueValid := false.B
+        mask := 0.U
+        outData := 0.U.asTypeOf(outData)
+      }
+    }
+  }
 }
 

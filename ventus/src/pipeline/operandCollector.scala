@@ -637,7 +637,7 @@ class operandCollector extends Module{
       val out = Wire(new Bool)
       // sALU | CSR | warpscheduler
       // vFPU | vSFU | vALU&SIMT | vMUL | vTC | LSU
-      when(in.control.tc || in.control.fp || in.control.mul || in.control.sfu || in.control.mem) {
+      when(in.control.tc || in.control.fp || in.control.mul || in.control.sfu || in.control.unfu || in.control.mem) {
         out := true.B
       }.elsewhen(in.control.csr.orR || in.control.barrier) {
         out := false.B

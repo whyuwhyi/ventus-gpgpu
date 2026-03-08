@@ -14,3 +14,10 @@
 [submodule "dependencies/Membox2.Scala"]
 	path = dependencies/Membox2.Scala
 	url = https://github.com/THU-DSP-LAB/Membox2.Scala.git
+[submodule "dependencies/unfu"]
+	path = dependencies/unfu
+	url = git@github.com:whyuwhyi/unfu.git
+[submodule "dependencies/mma-sim"]
+	path = dependencies/mma-sim
+	url = git@github.com:whyuwhyi/mma-sim.git
+	branch = whywhy
