@@ -3,6 +3,14 @@ package pipeline
 import chisel3._
 import chisel3.util._
 import dotproduct.{FDA_HP, FDA_HPInput}
+import top.parameters._
+
+class MMAIssueData extends Bundle {
+  val aWindow = Vec(MMAConst.MaxARegs, Vec(num_thread, UInt(xLen.W)))
+  val bWindow = Vec(MMAConst.MaxBRegs, Vec(num_thread, UInt(xLen.W)))
+  val cWindow = Vec(MMAConst.MaxCDRegs, Vec(num_thread, UInt(xLen.W)))
+  val ctrl = new CtrlSigs()
+}
 
 class MMAFragmentInput extends Bundle {
   val shape = UInt(3.W)
@@ -124,4 +132,134 @@ class MMADotArray(arrayM: Int, arrayN: Int) extends Module {
 
   io.in.ready := lanes.map(_.io.in.ready).reduce(_ && _)
   io.out.valid := lanes.map(_.io.out.valid).reduce(_ && _)
+}
+
+class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
+  require(num_thread == 32, "warp-level MMA currently requires 32 threads")
+  val io = IO(new Bundle {
+    val in = Flipped(Decoupled(new MMAIssueData))
+    val out_v = Decoupled(new WriteVecCtrl)
+  })
+
+  val dataBuffer = Queue(io.in, 1)
+  val canonicalizer = Module(new MMAFragmentCanonicalizer)
+  canonicalizer.io.in.shape := dataBuffer.bits.ctrl.mma_shape
+  canonicalizer.io.in.abtype := dataBuffer.bits.ctrl.mma_abtype
+  canonicalizer.io.in.cdtype := dataBuffer.bits.ctrl.mma_cdtype
+  canonicalizer.io.in.alayout := dataBuffer.bits.ctrl.mma_alayout
+  canonicalizer.io.in.blayout := dataBuffer.bits.ctrl.mma_blayout
+  canonicalizer.io.in.aWindow := dataBuffer.bits.aWindow
+  canonicalizer.io.in.bWindow := dataBuffer.bits.bWindow
+  canonicalizer.io.in.cWindow := dataBuffer.bits.cWindow
+
+  val dotArray = Module(new MMADotArray(arrayM, arrayN))
+
+  val sIdle :: sIssue :: sWait :: sDrain :: Nil = Enum(4)
+  val state = RegInit(sIdle)
+  val rowBase = RegInit(0.U(5.W))
+  val colBase = RegInit(0.U(5.W))
+  val drainIdx = RegInit(0.U(4.W))
+  val resultTile = RegInit(VecInit(Seq.fill(16)(VecInit(Seq.fill(16)(0.U(xLen.W))))))
+
+  val mDim = canonicalizer.io.out.mDim
+  val nDim = canonicalizer.io.out.nDim
+  val cdRegs = MMAWindowInfo.srcCDRegs(dataBuffer.bits.ctrl.mma_shape, dataBuffer.bits.ctrl.mma_cdtype)
+
+  dotArray.io.in.valid := false.B
+  dotArray.io.in.bits := 0.U.asTypeOf(new MMADotArrayInput(arrayM, arrayN))
+  dotArray.io.out.ready := false.B
+  for (r <- 0 until arrayM) {
+    for (k <- 0 until 16) {
+      dotArray.io.in.bits.vecA(r)(k) := canonicalizer.io.out.a(rowBase + r.U)(k)
+    }
+  }
+  for (c <- 0 until arrayN) {
+    for (k <- 0 until 16) {
+      dotArray.io.in.bits.vecB(c)(k) := canonicalizer.io.out.b(colBase + c.U)(k)
+    }
+  }
+  for (r <- 0 until arrayM) {
+    for (c <- 0 until arrayN) {
+      dotArray.io.in.bits.c(r * arrayN + c) := canonicalizer.io.out.c(rowBase + r.U)(colBase + c.U)
+    }
+  }
+  dotArray.io.in.bits.abtype := dataBuffer.bits.ctrl.mma_abtype
+  dotArray.io.in.bits.cdtype := dataBuffer.bits.ctrl.mma_cdtype
+
+  dataBuffer.ready := false.B
+  io.out_v.valid := false.B
+  io.out_v.bits := 0.U.asTypeOf(new WriteVecCtrl)
+  io.out_v.bits.warp_id := dataBuffer.bits.ctrl.wid
+  io.out_v.bits.reg_idxw := dataBuffer.bits.ctrl.reg_idxw + drainIdx
+  io.out_v.bits.wvd := true.B
+  if (SPIKE_OUTPUT) {
+    io.out_v.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
+  }
+  io.out_v.bits.wvd_mask.foreach(_ := true.B)
+
+  val flatTile = VecInit.tabulate(256)(i => resultTile(i / 16)(i % 16))
+  val flatElemsPerReg = Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, 32.U, 64.U)
+  val totalElems = mDim * nDim
+  for (lane <- 0 until num_thread) {
+    val baseIdx = drainIdx * flatElemsPerReg + Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, lane.U, (lane * 2).U)
+    val nextIdx = baseIdx + 1.U
+    val baseValid = baseIdx < totalElems
+    val nextValid = nextIdx < totalElems
+    val fp32Val = Mux(baseValid, flatTile(baseIdx), 0.U)
+    val fp16Lo = Mux(baseValid, flatTile(baseIdx)(15, 0), 0.U(16.W))
+    val fp16Hi = Mux(nextValid, flatTile(nextIdx)(15, 0), 0.U(16.W))
+    io.out_v.bits.wb_wvd_rd(lane) := Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U,
+      fp32Val,
+      Cat(fp16Hi, fp16Lo))
+  }
+
+  switch(state) {
+    is(sIdle) {
+      when(dataBuffer.valid) {
+        rowBase := 0.U
+        colBase := 0.U
+        drainIdx := 0.U
+        resultTile := 0.U.asTypeOf(resultTile)
+        state := sIssue
+      }
+    }
+    is(sIssue) {
+      dotArray.io.in.valid := dataBuffer.valid
+      when(dotArray.io.in.fire) {
+        state := sWait
+      }
+    }
+    is(sWait) {
+      dotArray.io.out.ready := true.B
+      when(dotArray.io.out.fire) {
+        for (r <- 0 until arrayM) {
+          for (c <- 0 until arrayN) {
+            when((rowBase + r.U) < mDim && (colBase + c.U) < nDim) {
+              resultTile(rowBase + r.U)(colBase + c.U) := dotArray.io.out.bits.result(r * arrayN + c)
+            }
+          }
+        }
+        val nextRow = rowBase + arrayM.U
+        val nextCol = Mux(nextRow >= mDim, colBase + arrayN.U, colBase)
+        rowBase := Mux(nextRow >= mDim, 0.U, nextRow)
+        colBase := nextCol
+        when(nextCol >= nDim) {
+          state := sDrain
+        }.otherwise {
+          state := sIssue
+        }
+      }
+    }
+    is(sDrain) {
+      io.out_v.valid := true.B
+      when(io.out_v.fire) {
+        when(drainIdx + 1.U >= cdRegs) {
+          state := sIdle
+          dataBuffer.ready := true.B
+        }.otherwise {
+          drainIdx := drainIdx + 1.U
+        }
+      }
+    }
+  }
 }

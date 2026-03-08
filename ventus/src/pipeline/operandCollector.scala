@@ -43,6 +43,131 @@ class issueIO extends Bundle{
   val mask = Vec(num_thread, Bool())
   val control = new CtrlSigs
 }
+
+class MMACollectorUnit extends Module {
+  val io = IO(new Bundle {
+    val control = Flipped(Decoupled(new CtrlSigs))
+    val bankIn = Vec(4, Flipped(Decoupled(new crossbar2CU)))
+    val mmaIssue = Decoupled(new MMAIssueData)
+    val outArbiterIO = Vec(4, Decoupled(new CU2Arbiter))
+    val vgpr_base = Input(Vec(num_warp, UInt((VGPR_ID_WIDTH + 1).W)))
+  })
+
+  val s_idle :: s_add :: s_out :: Nil = Enum(3)
+  val state = RegInit(s_idle)
+  val controlReg = Reg(new CtrlSigs)
+
+  val mmaAWindow = RegInit(VecInit(Seq.fill(MMAConst.MaxARegs)(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))))
+  val mmaBWindow = RegInit(VecInit(Seq.fill(MMAConst.MaxBRegs)(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))))
+  val mmaCWindow = RegInit(VecInit(Seq.fill(MMAConst.MaxCDRegs)(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))))
+
+  val batchBase = RegInit(0.U(5.W))
+  val batchCount = RegInit(0.U(3.W))
+  val reqIssued = RegInit(VecInit(Seq.fill(4)(false.B)))
+  val respDone = RegInit(VecInit(Seq.fill(4)(false.B)))
+
+  val aRegs = MMAWindowInfo.srcARegs(controlReg.mma_shape)
+  val bRegs = MMAWindowInfo.srcBRegs(controlReg.mma_shape)
+  val cRegs = MMAWindowInfo.srcCDRegs(controlReg.mma_shape, controlReg.mma_cdtype)
+  val totalRegs = aRegs +& bRegs +& cRegs
+
+  def channelActive(i: Int): Bool = i.U < batchCount
+  def batchAllIssued: Bool = VecInit.tabulate(4)(i => !channelActive(i) || reqIssued(i)).asUInt.andR
+  def batchAllDone: Bool = VecInit.tabulate(4)(i => !channelActive(i) || respDone(i)).asUInt.andR
+
+  def absIdx(i: Int): UInt = batchBase + i.U
+
+  def reqRegIdx(idx: UInt): UInt = {
+    val out = Wire(UInt((regidx_width + regext_width).W))
+    out := controlReg.reg_idxw
+    when(idx < aRegs) {
+      out := controlReg.reg_idx1 + idx
+    }.elsewhen(idx < (aRegs +& bRegs)) {
+      out := controlReg.reg_idx2 + (idx - aRegs)
+    }.otherwise {
+      out := controlReg.reg_idxw + (idx - aRegs - bRegs)
+    }
+    out
+  }
+
+  def resetWindows(): Unit = {
+    mmaAWindow.foreach(_.foreach(_ := 0.U))
+    mmaBWindow.foreach(_.foreach(_ := 0.U))
+    mmaCWindow.foreach(_.foreach(_ := 0.U))
+  }
+
+  io.control.ready := state === s_idle
+  io.mmaIssue.valid := state === s_out
+  io.mmaIssue.bits.ctrl := controlReg
+  io.mmaIssue.bits.aWindow := mmaAWindow
+  io.mmaIssue.bits.bWindow := mmaBWindow
+  io.mmaIssue.bits.cWindow := mmaCWindow
+
+  (0 until 4).foreach { i =>
+    val reqIdx = reqRegIdx(absIdx(i))
+    io.outArbiterIO(i).valid := state === s_add && channelActive(i) && !reqIssued(i)
+    io.outArbiterIO(i).bits.rsType := 2.U
+    io.outArbiterIO(i).bits.bankID := controlReg.wid(widSliceHigh, 0) + reqIdx(log2Ceil(num_bank) - 1, 0)
+    io.outArbiterIO(i).bits.rsAddr := (io.vgpr_base(controlReg.wid) >> log2Ceil(num_bank).U).asUInt + (reqIdx >> log2Ceil(num_bank).U)
+    io.bankIn(i).ready := state === s_add
+  }
+
+  when(state === s_idle) {
+    when(io.control.fire) {
+      controlReg := io.control.bits
+      batchBase := 0.U
+      batchCount := Mux(MMAWindowInfo.srcARegs(io.control.bits.mma_shape) +& MMAWindowInfo.srcBRegs(io.control.bits.mma_shape) +&
+        MMAWindowInfo.srcCDRegs(io.control.bits.mma_shape, io.control.bits.mma_cdtype) > 4.U,
+        4.U, MMAWindowInfo.srcARegs(io.control.bits.mma_shape) +& MMAWindowInfo.srcBRegs(io.control.bits.mma_shape) +&
+          MMAWindowInfo.srcCDRegs(io.control.bits.mma_shape, io.control.bits.mma_cdtype))(2, 0)
+      reqIssued.foreach(_ := false.B)
+      respDone.foreach(_ := false.B)
+      resetWindows()
+      state := s_add
+    }
+  }.elsewhen(state === s_add) {
+    (0 until 4).foreach { i =>
+      when(io.outArbiterIO(i).fire) {
+        reqIssued(i) := true.B
+      }
+      when(io.bankIn(i).fire) {
+        val idx = batchBase + io.bankIn(i).bits.regOrder
+        when(idx < aRegs) {
+          for (j <- 0 until MMAConst.MaxARegs) {
+            when(idx === j.U) { mmaAWindow(j) := io.bankIn(i).bits.data }
+          }
+        }.elsewhen(idx < (aRegs +& bRegs)) {
+          val bIdx = idx - aRegs
+          for (j <- 0 until MMAConst.MaxBRegs) {
+            when(bIdx === j.U) { mmaBWindow(j) := io.bankIn(i).bits.data }
+          }
+        }.otherwise {
+          val cIdx = idx - aRegs - bRegs
+          for (j <- 0 until MMAConst.MaxCDRegs) {
+            when(cIdx === j.U) { mmaCWindow(j) := io.bankIn(i).bits.data }
+          }
+        }
+        respDone(io.bankIn(i).bits.regOrder) := true.B
+      }
+    }
+
+    when(batchAllIssued && batchAllDone) {
+      val nextBase = batchBase + batchCount
+      when(nextBase >= totalRegs) {
+        state := s_out
+      }.otherwise {
+        batchBase := nextBase
+        batchCount := Mux(totalRegs - nextBase > 4.U, 4.U, totalRegs - nextBase)(2, 0)
+        reqIssued.foreach(_ := false.B)
+        respDone.foreach(_ := false.B)
+      }
+    }
+  }.elsewhen(state === s_out) {
+    when(io.mmaIssue.fire) {
+      state := s_idle
+    }
+  }
+}
 /**
  *One of the number of num_warp collector Units, instantiating this class in operand collector for num_warps.
  */
@@ -326,28 +451,28 @@ class collectorUnit extends Module{
  * Arbitrating which reading (TO DO: writing) request should
  * be send to register files
  */
-class operandArbiter extends Module{
+class operandArbiter(numCU: Int) extends Module{
   val io = IO(new Bundle{
-    val readArbiterIO = Vec(num_collectorUnit, Vec(4, Flipped(Decoupled(new CU2Arbiter))))
+    val readArbiterIO = Vec(numCU, Vec(4, Flipped(Decoupled(new CU2Arbiter))))
     val readArbiterOutScalar = Vec(num_bank, Decoupled(new CU2Arbiter)) //address of registers to be read that in Scalar bank
     val readArbiterOutVector = Vec(num_bank, Decoupled(new CU2Arbiter)) //address of registers to be read that in Vector bank
-    val readchosenScalar = Output(Vec(num_bank, UInt((log2Ceil(4*num_collectorUnit)).W)))// which operand read request is chosen
-    val readchosenVector = Output(Vec(num_bank, UInt((log2Ceil(4*num_collectorUnit)).W)))// which operand read request is chosen
+    val readchosenScalar = Output(Vec(num_bank, UInt((log2Ceil(4*numCU)).W)))// which operand read request is chosen
+    val readchosenVector = Output(Vec(num_bank, UInt((log2Ceil(4*numCU)).W)))// which operand read request is chosen
     //    val writeArbiterIO = Decoupled(/*write arbiter, TBD   */)
 
   })
   val bankArbiterScalar = for(i<-0 until num_bank)yield{
-    val x = Module(new RRArbiter(new CU2Arbiter, 4*num_collectorUnit))
+    val x = Module(new RRArbiter(new CU2Arbiter, 4*numCU))
     x
   }
   val bankArbiterVector = for (i <- 0 until num_bank) yield {
-    val x = Module(new RRArbiter(new CU2Arbiter, 4 * num_collectorUnit))
+    val x = Module(new RRArbiter(new CU2Arbiter, 4 * numCU))
     x
   }
 
   for (i <- 0 until num_bank) {
     //    mapping input signals from collector units to inputs of Arbiters
-    for (j <- 0 until num_collectorUnit){
+    for (j <- 0 until numCU){
       for (k <- 0 until 4){
         bankArbiterScalar(i).io.in(j*4+k) <> io.readArbiterIO(j)(k)
         bankArbiterVector(i).io.in(j*4+k) <> io.readArbiterIO(j)(k)
@@ -357,7 +482,7 @@ class operandArbiter extends Module{
 
   //elaborate valid port of readArbiters
   for (i <- 0 until num_bank){
-    for(j <- 0 until num_collectorUnit)
+    for(j <- 0 until numCU)
       for(k <- 0 until 4){
         bankArbiterScalar(i).io.in(j*4+k).valid := io.readArbiterIO(j)(k).valid &&
           (io.readArbiterIO(j)(k).bits.bankID === i.U) && (io.readArbiterIO(j)(k).bits.rsType === 1.U)
@@ -377,10 +502,10 @@ class operandArbiter extends Module{
 
 }
 
-class crossBar  extends Module{
+class crossBar(numCU: Int) extends Module{
   val io = IO(new Bundle {
-    val chosenScalar = Input(Vec(num_bank, UInt(log2Ceil(4 * num_collectorUnit).W)))
-    val chosenVector = Input(Vec(num_bank, UInt(log2Ceil(4 * num_collectorUnit).W)))
+    val chosenScalar = Input(Vec(num_bank, UInt(log2Ceil(4 * numCU).W)))
+    val chosenVector = Input(Vec(num_bank, UInt(log2Ceil(4 * numCU).W)))
     val validArbiterScalar = Input(Vec(num_bank, Bool()))
     val validArbiterVector = Input(Vec(num_bank, Bool()))
     val dataInScalar = Input(new Bundle{
@@ -390,10 +515,10 @@ class crossBar  extends Module{
       val rs = Vec(num_bank, Vec(num_thread, UInt(xLen.W)))
       val v0 = Vec(num_bank, Vec(num_thread, UInt((xLen).W)))
     })
-    val out = Vec(num_collectorUnit, Vec(4, Decoupled(new crossbar2CU)))
+    val out = Vec(numCU, Vec(4, Decoupled(new crossbar2CU)))
   })
-  val CUIdScalar = Wire(Vec(num_bank, UInt(log2Ceil(num_collectorUnit).W)))
-  val CUIdVector = Wire(Vec(num_bank, UInt(log2Ceil(num_collectorUnit).W)))
+  val CUIdScalar = Wire(Vec(num_bank, UInt(log2Ceil(numCU).W)))
+  val CUIdVector = Wire(Vec(num_bank, UInt(log2Ceil(numCU).W)))
   val regOrderScalar = Wire(Vec(num_bank, UInt(2.W)))
   val regOrderVector = Wire(Vec(num_bank, UInt(2.W)))
 
@@ -411,7 +536,7 @@ class crossBar  extends Module{
   io.out.foreach(_.foreach(_.valid := (false.B)))
   io.out.foreach(_.foreach(_.bits.regOrder := 0.U))
   for( i <- 0 until num_bank){
-    for(j <- 0 until num_collectorUnit){
+    for(j <- 0 until numCU){
       for(k <- 0 until 4){
         when((CUIdScalar(i)===j.U) && io.validArbiterScalar(i) &&(regOrderScalar(i)===k.U)){
           io.out(j)(k).bits.data := VecInit.fill(num_thread)(io.dataInScalar.rs(i))
@@ -520,6 +645,7 @@ class operandCollector extends Module{
     val controlX=Flipped(Decoupled(new CtrlSigs()))
     val controlV=Flipped(Decoupled(new CtrlSigs()))
     val out=Vec(2, Decoupled(new issueIO))
+    val outMMA = Decoupled(new MMAIssueData)
     val writeScalarCtrl=Flipped(DecoupledIO(new WriteScalarCtrl)) //should be used as decoupledIO
     val writeVecCtrl=Flipped(DecoupledIO(new WriteVecCtrl))
     val sgpr_base = Input(Vec(num_warp,UInt((SGPR_ID_WIDTH+1).W)))
@@ -528,7 +654,8 @@ class operandCollector extends Module{
     val vectorBanks = if (GVM_ENABLED) Some(Output(Vec(num_bank, Vec(NUMBER_VGPR_SLOTS / num_bank, Vec(num_thread, UInt(xLen.W)))))) else None
   })
   val collectorUnits = VecInit(Seq.fill(num_collectorUnit)(Module(new collectorUnit).io))
-  val Arbiter = Module(new operandArbiter)
+  val mmaCollector = Module(new MMACollectorUnit).io
+  val Arbiter = Module(new operandArbiter(num_collectorUnit + 1))
   val vectorBank = VecInit(Seq.fill(num_bank)(Module(new FloatRegFileBank).io))
   val scalarBank = VecInit(Seq.fill(num_bank)(Module(new RegFileBank).io))
   if (GVM_ENABLED) {
@@ -537,10 +664,11 @@ class operandCollector extends Module{
        io.vectorBanks.get(i) := vectorBank(i).all_regs.get
     })
   }
-  val crossBar = Module(new crossBar)
+  val crossBar = Module(new crossBar(num_collectorUnit + 1))
   val Demux = Module(new instDemux)
   // connecting Arbiters and banks
   (0 until num_collectorUnit).foreach(i => {collectorUnits(i).outArbiterIO <> Arbiter.io.readArbiterIO(i)})
+  mmaCollector.outArbiterIO <> Arbiter.io.readArbiterIO(num_collectorUnit)
   (0 until num_bank).foreach(i=>{
     vectorBank(i).rsidx := Arbiter.io.readArbiterOutVector(i).bits.rsAddr
     scalarBank(i).rsidx := Arbiter.io.readArbiterOutScalar(i).bits.rsAddr
@@ -559,6 +687,7 @@ class operandCollector extends Module{
   }
   // connecting crossbar and collector units
   (0 until num_collectorUnit).foreach(i => {collectorUnits(i).bankIn <> crossBar.io.out(i)})
+  mmaCollector.bankIn <> crossBar.io.out(num_collectorUnit)
 
   //CU allocation
   val widReg = RegInit(VecInit.fill(num_collectorUnit)(0.U(log2Ceil(num_collectorUnit).W)))
@@ -569,8 +698,12 @@ class operandCollector extends Module{
     widCmp(i) := 0.U
   })
   Demux.io.widCmp := widCmp
-  Demux.io.in(0) <> io.controlV
+  Demux.io.in(0).bits := io.controlV.bits
+  Demux.io.in(0).valid := io.controlV.valid && !io.controlV.bits.mma
   Demux.io.in(1) <> io.controlX
+  mmaCollector.control.bits := io.controlV.bits
+  mmaCollector.control.valid := io.controlV.valid && io.controlV.bits.mma
+  io.controlV.ready := Mux(io.controlV.bits.mma, mmaCollector.control.ready, Demux.io.in(0).ready)
   Demux.io.sgpr_baseIn := io.sgpr_base
   Demux.io.vgpr_baseIn := io.vgpr_base
   for(i <- 0 until num_collectorUnit){
@@ -578,6 +711,7 @@ class operandCollector extends Module{
     collectorUnits(i).sgpr_base := Demux.io.sgpr_baseOut
     collectorUnits(i).vgpr_base := Demux.io.vgpr_baseOut
   }
+  mmaCollector.vgpr_base := Demux.io.vgpr_baseOut
 
   // writeback control
   // bankID = (wid + regIdx) % num_bank
@@ -671,5 +805,6 @@ class operandCollector extends Module{
   }
   io.out(0) <> issueUnit.io.out_v
   io.out(1) <> issueUnit.io.out_x
+  io.outMMA <> mmaCollector.mmaIssue
 }
 

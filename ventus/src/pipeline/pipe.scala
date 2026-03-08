@@ -91,8 +91,9 @@ class pipe() extends Module{
   val unfu=Module(new UNFUexe)
   val mul=Module(new vMULv2(num_thread,num_lane))
   val tensorcore=Module(new vTCexe)
+  val mmaexe=Module(new vMMAexe)
   val lsu2wb=Module(new LSU2WB)
-  val wb=Module(new Writeback(6,8))
+  val wb=Module(new Writeback(6,9))
 
   val inst_cnt_xv = RegInit(VecInit(0.U(32.W), 0.U(32.W)))
   if(INST_CNT_2){
@@ -276,9 +277,9 @@ class pipe() extends Module{
   val op_colX_in_wid = Wire(UInt(depth_warp.W))
   val op_colX_out_wid = Wire(UInt(depth_warp.W))
   op_colV_in_wid := operand_collector.io.controlV.bits.wid
-  op_colV_out_wid := operand_collector.io.out(0).bits.control.wid
+  op_colV_out_wid := Mux(operand_collector.io.outMMA.fire, operand_collector.io.outMMA.bits.ctrl.wid, operand_collector.io.out(0).bits.control.wid)
   scoreb(op_colV_in_wid).op_colV_in_fire:=operand_collector.io.controlV.fire
-  scoreb(op_colV_out_wid).op_colV_out_fire:=operand_collector.io.out(0).fire
+  scoreb(op_colV_out_wid).op_colV_out_fire:=operand_collector.io.out(0).fire || operand_collector.io.outMMA.fire
 
   op_colX_in_wid := operand_collector.io.controlX.bits.wid
   op_colX_out_wid := operand_collector.io.out(1).bits.control.wid
@@ -307,6 +308,7 @@ class pipe() extends Module{
   operand_collector.io.controlX<>ibuffer2issue.io.out_x//ibuffer2issue.io.out.bits
   operand_collector.io.writeVecCtrl<>wb.io.out_v
   operand_collector.io.writeScalarCtrl<>wb.io.out_x
+  operand_collector.io.outMMA.ready := mmaexe.io.in.ready
 
   simt_stack.io.input_wid:=operand_collector.io.out(0).bits.control.wid//ibuffer2issue.io.out.bits.wid
   csrfile.io.simt_wid := operand_collector.io.out(0).bits.control.wid // todo check this
@@ -404,6 +406,7 @@ class pipe() extends Module{
   issueV.io.out_UNFU<>unfu.io.in
   issueX.io.out_UNFU.ready := false.B
   unfu.io.out_x.ready := false.B
+  mmaexe.io.in <> operand_collector.io.outMMA
   //simt_stack.io.branch_ctl<>Queue(issue.io.out_SIMT,1,flow = true)
   simt_stack.io.if_mask<>valu.io.out2simt_stack
   simt_stack.io.fetch_ctl<>branch_back.io.in1
@@ -446,8 +449,9 @@ class pipe() extends Module{
   wb.io.in_v(3)<>sfu.io.out_v
   wb.io.in_v(4)<>unfu.io.out_v
   wb.io.in_v(5)<>mul.io.out_v
-  wb.io.in_v(6)<>tensorcore.io.out_v
-  wb.io.in_v(7)<>csrfile.io.out_v
+  wb.io.in_v(6)<>mmaexe.io.out_v
+  wb.io.in_v(7)<>tensorcore.io.out_v
+  wb.io.in_v(8)<>csrfile.io.out_v
 
   issue_stall:=(~issueX.io.in.ready).asBool | (~issueV.io.in.ready).asBool//scoreb.io.delay | issue.io.in.ready
 }

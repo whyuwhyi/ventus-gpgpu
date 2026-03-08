@@ -132,6 +132,17 @@ object IDecode //extends DecodeConstants
   def FN_IU2F      = 32.U(6.W) // 100 000
   def FN_I2F     = 33.U(6.W) // 100 001
 
+  def FN_VADD_F16X2 = 36.U(6.W)
+  def FN_VMUL_F16X2 = 37.U(6.W)
+  def FN_VFMA_F16X2 = 38.U(6.W)
+  def FN_VADD_BF16X2 = 39.U(6.W)
+  def FN_VMUL_BF16X2 = 40.U(6.W)
+  def FN_VFMA_BF16X2 = 41.U(6.W)
+  def FN_VCVT_FP32_FP16 = 42.U(6.W)
+  def FN_VCVT_FP16_FP32 = 43.U(6.W)
+  def FN_VCVT_FP32_BF16 = 44.U(6.W)
+  def FN_VCVT_BF16_FP32 = 45.U(6.W)
+
   // for SFU
   def FN_DIV      = 0.U(6.W)
   def FN_REM      = 1.U(6.W)
@@ -526,7 +537,17 @@ object IDecodeLUT_VC{
     VADD12_VI->   List(Y,N,N,B_N,N,N,CSR.N,Y,A3_X,A2_IMM,A1_VRS1,IMM_I,MEM_X,FN_ADD,N,M_X,N,N,N,Y,N,N,N,N,Y,N,N),
     VSUB12_VI->   List(Y,N,N,B_N,N,N,CSR.N,N,A3_X,A2_IMM,A1_VRS1,IMM_I,MEM_X,FN_SUB,N,M_X,N,N,N,Y,N,N,N,N,Y,N,N),
     VFTTA_VV->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_TTF,N,M_X,N,N,N,Y,N,N,N,Y,N,N,N),
-    VFEXP_V ->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_EXP,N,M_X,N,N,Y,Y,N,N,N,N,N,N,N)
+    VFEXP_V ->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_EXP,N,M_X,N,N,Y,Y,N,N,N,N,N,N,N),
+    VCVT_FP32_FP16 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_VCVT_FP32_FP16,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VCVT_FP16_FP32 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_VCVT_FP16_FP32,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VCVT_FP32_BF16 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_VCVT_FP32_BF16,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VCVT_BF16_FP32 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_X,IMM_X,MEM_X,FN_VCVT_BF16_FP32,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VADD_F16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VADD_F16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VMUL_F16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VMUL_F16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VFMA_F16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VFMA_F16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VADD_BF16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VADD_BF16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VMUL_BF16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VMUL_BF16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N),
+    VFMA_BF16X2 -> List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_VFMA_BF16X2,N,M_X,N,N,N,Y,N,N,N,N,N,N,N)
     //VHTTA_VV->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_TTH,N,M_X,N,N,N,Y,N,N,N,Y,N,N,N),
     //VBTTA_VV->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_TTB,N,M_X,N,N,N,Y,N,N,N,Y,N,N,N),
 
@@ -606,6 +627,8 @@ class InstrDecodeV2 extends Module {
         BitPat("b1111011") -> lut(2),
         BitPat("b0?00111") -> lut(2),
         BitPat("b0101011") -> lut(2),
+        BitPat("b1111010") -> lut(3),
+        BitPat("b1011010") -> lut(3),
         BitPat("b1011011") -> lut(3),
         BitPat("b0001011") -> lut(3)
       ))

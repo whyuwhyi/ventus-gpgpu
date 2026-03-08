@@ -156,3 +156,54 @@ class MMAFragmentCanonicalizerTest extends AnyFreeSpec with ChiselScalatestTeste
     }
   }
 }
+
+
+class MMAExecutionTest extends AnyFreeSpec with ChiselScalatestTester {
+  "execute a full m8n8k16 fp16->fp32 mma tile and drain D window" in {
+    test(new pipeline.vMMAexe()) { dut =>
+      dut.io.in.valid.poke(true.B)
+      dut.io.in.bits.ctrl.mma.poke(true.B)
+      dut.io.in.bits.ctrl.mma_shape.poke(pipeline.MMAConst.ShapeM8N8K16.U)
+      dut.io.in.bits.ctrl.mma_abtype.poke(pipeline.MMAConst.ABTypeFP16.U)
+      dut.io.in.bits.ctrl.mma_cdtype.poke(pipeline.MMAConst.CDTypeFP32.U)
+      dut.io.in.bits.ctrl.mma_alayout.poke(false.B)
+      dut.io.in.bits.ctrl.mma_blayout.poke(true.B)
+      dut.io.in.bits.ctrl.reg_idxw.poke(6.U)
+      dut.io.in.bits.ctrl.wid.poke(0.U)
+      for (reg <- 0 until pipeline.MMAConst.MaxARegs) {
+        for (lane <- 0 until 32) {
+          dut.io.in.bits.aWindow(reg)(lane).poke("h3c003c00".U)
+        }
+      }
+      for (reg <- 0 until pipeline.MMAConst.MaxBRegs) {
+        for (lane <- 0 until 32) {
+          dut.io.in.bits.bWindow(reg)(lane).poke("h3c003c00".U)
+        }
+      }
+      for (reg <- 0 until pipeline.MMAConst.MaxCDRegs) {
+        for (lane <- 0 until 32) {
+          dut.io.in.bits.cWindow(reg)(lane).poke(0.U)
+        }
+      }
+      dut.io.out_v.ready.poke(true.B)
+      while (!dut.io.in.ready.peek().litToBoolean) {
+        dut.clock.step()
+      }
+      dut.clock.step()
+      dut.io.in.valid.poke(false.B)
+
+      var beats = 0
+      var cycles = 0
+      while (beats < 2 && cycles < 512) {
+        if (dut.io.out_v.valid.peek().litToBoolean) {
+          dut.io.out_v.bits.reg_idxw.expect((6 + beats).U)
+          dut.io.out_v.bits.wb_wvd_rd.foreach(_.expect("h41800000".U))
+          beats += 1
+        }
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(beats == 2)
+    }
+  }
+}

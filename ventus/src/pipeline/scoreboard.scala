@@ -115,7 +115,10 @@ class Scoreboard extends Module{
   val OpColRegX=new ScoreboardUtil(1)
   val fenceReg=new ScoreboardUtil(1) // after LSU rebuild, this could be cancelled.
   // TODO: CSR operation may cause unexpected situation.
-  vectorReg.set(io.if_fire & io.if_ctrl.wvd,io.if_ctrl.reg_idxw)
+  vectorReg.set(io.if_fire & io.if_ctrl.wvd & !io.if_ctrl.mma,io.if_ctrl.reg_idxw)
+  for (i <- 0 until MMAConst.MaxCDRegs) {
+    vectorReg.set(io.if_fire & io.if_ctrl.mma & io.if_ctrl.wvd & (i.U < MMAWindowInfo.srcCDRegs(io.if_ctrl.mma_shape, io.if_ctrl.mma_cdtype)), io.if_ctrl.reg_idxw + i.U)
+  }
   vectorReg.clear(io.wb_v_fire & io.wb_v_ctrl.wvd,io.wb_v_ctrl.reg_idxw)
   scalarReg.set(io.if_fire & io.if_ctrl.wxd,io.if_ctrl.reg_idxw)
   scalarReg.clear(io.wb_x_fire & io.wb_x_ctrl.wxd,io.wb_x_ctrl.reg_idxw)
@@ -135,7 +138,23 @@ class Scoreboard extends Module{
     A3_PC-> Mux(io.ibuffer_if_ctrl.branch===B_R, scalarReg.read(io.ibuffer_if_ctrl.reg_idx1),false.B)
   ))
   val readm=Mux(io.ibuffer_if_ctrl.mask,vectorReg.read(0.U),false.B)
-  val readw=Mux(io.ibuffer_if_ctrl.wxd,scalarReg.read(io.ibuffer_if_ctrl.reg_idxw),false.B)|Mux(io.ibuffer_if_ctrl.wvd,vectorReg.read(io.ibuffer_if_ctrl.reg_idxw),false.B)
+  val mmaReadA = VecInit.tabulate(MMAConst.MaxARegs)(i =>
+    io.ibuffer_if_ctrl.mma && (i.U < MMAWindowInfo.srcARegs(io.ibuffer_if_ctrl.mma_shape)) &&
+      vectorReg.read(io.ibuffer_if_ctrl.reg_idx1 + i.U)
+  ).asUInt.orR
+  val mmaReadB = VecInit.tabulate(MMAConst.MaxBRegs)(i =>
+    io.ibuffer_if_ctrl.mma && (i.U < MMAWindowInfo.srcBRegs(io.ibuffer_if_ctrl.mma_shape)) &&
+      vectorReg.read(io.ibuffer_if_ctrl.reg_idx2 + i.U)
+  ).asUInt.orR
+  val mmaReadC = VecInit.tabulate(MMAConst.MaxCDRegs)(i => {
+    val inCD = i.U < MMAWindowInfo.srcCDRegs(io.ibuffer_if_ctrl.mma_shape, io.ibuffer_if_ctrl.mma_cdtype)
+    io.ibuffer_if_ctrl.mma && inCD && vectorReg.read(io.ibuffer_if_ctrl.reg_idxw + i.U)
+  }).asUInt.orR
+  val mmaReadD = VecInit.tabulate(MMAConst.MaxCDRegs)(i => {
+    val inCD = i.U < MMAWindowInfo.srcCDRegs(io.ibuffer_if_ctrl.mma_shape, io.ibuffer_if_ctrl.mma_cdtype)
+    io.ibuffer_if_ctrl.mma && inCD && vectorReg.read(io.ibuffer_if_ctrl.reg_idxw + i.U)
+  }).asUInt.orR
+  val readw=Mux(io.ibuffer_if_ctrl.wxd,scalarReg.read(io.ibuffer_if_ctrl.reg_idxw),false.B)|Mux(io.ibuffer_if_ctrl.wvd & !io.ibuffer_if_ctrl.mma,vectorReg.read(io.ibuffer_if_ctrl.reg_idxw),false.B)|mmaReadD
   val readb=beqReg.read(0.U)
   val read_op_colV=OpColRegV.read(0.U)
   val read_op_colX=OpColRegX.read(0.U)
@@ -148,5 +167,5 @@ class Scoreboard extends Module{
   dontTouch(readb)
   dontTouch(readf)
   dontTouch(io)
-  io.delay:=read1|read2|read3|readm|readw|readb|readf|read_op_colV|read_op_colX
+  io.delay:=read1|read2|read3|readm|readw|readb|readf|read_op_colV|read_op_colX|mmaReadA|mmaReadB|mmaReadC
 }
