@@ -197,17 +197,21 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
   }
   io.out_v.bits.wvd_mask.foreach(_ := true.B)
 
-  val flatTile = VecInit.tabulate(256)(i => resultTile(i / 16)(i % 16))
   val flatElemsPerReg = Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, 32.U, 64.U)
   val totalElems = mDim * nDim
+  def compactElem(idx: UInt): UInt = {
+    val row = Mux(nDim === 16.U, idx >> 4, idx >> 3)
+    val col = Mux(nDim === 16.U, idx(3, 0), idx(2, 0))
+    resultTile(row)(col)
+  }
   for (lane <- 0 until num_thread) {
     val baseIdx = drainIdx * flatElemsPerReg + Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, lane.U, (lane * 2).U)
     val nextIdx = baseIdx + 1.U
     val baseValid = baseIdx < totalElems
     val nextValid = nextIdx < totalElems
-    val fp32Val = Mux(baseValid, flatTile(baseIdx), 0.U)
-    val fp16Lo = Mux(baseValid, flatTile(baseIdx)(15, 0), 0.U(16.W))
-    val fp16Hi = Mux(nextValid, flatTile(nextIdx)(15, 0), 0.U(16.W))
+    val fp32Val = Mux(baseValid, compactElem(baseIdx), 0.U)
+    val fp16Lo = Mux(baseValid, compactElem(baseIdx)(15, 0), 0.U(16.W))
+    val fp16Hi = Mux(nextValid, compactElem(nextIdx)(15, 0), 0.U(16.W))
     io.out_v.bits.wb_wvd_rd(lane) := Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U,
       fp32Val,
       Cat(fp16Hi, fp16Lo))

@@ -481,6 +481,10 @@ class operandArbiter(numCU: Int) extends Module{
   }
 
   //elaborate valid port of readArbiters
+  for (j <- 0 until numCU)
+    for (k <- 0 until 4)
+      io.readArbiterIO(j)(k).ready := false.B
+
   for (i <- 0 until num_bank){
     for(j <- 0 until numCU)
       for(k <- 0 until 4){
@@ -488,7 +492,11 @@ class operandArbiter(numCU: Int) extends Module{
           (io.readArbiterIO(j)(k).bits.bankID === i.U) && (io.readArbiterIO(j)(k).bits.rsType === 1.U)
         bankArbiterVector(i).io.in(j*4+k).valid := io.readArbiterIO(j)(k).valid &&
           (io.readArbiterIO(j)(k).bits.bankID === i.U) && (io.readArbiterIO(j)(k).bits.rsType === 2.U)
-        io.readArbiterIO(j)(k).ready := bankArbiterScalar(i).io.in(j*4+k).ready
+        when((io.readArbiterIO(j)(k).bits.bankID === i.U) && (io.readArbiterIO(j)(k).bits.rsType === 1.U)) {
+          io.readArbiterIO(j)(k).ready := bankArbiterScalar(i).io.in(j*4+k).ready
+        }.elsewhen((io.readArbiterIO(j)(k).bits.bankID === i.U) && (io.readArbiterIO(j)(k).bits.rsType === 2.U)) {
+          io.readArbiterIO(j)(k).ready := bankArbiterVector(i).io.in(j*4+k).ready
+        }
       }
   }
   (0 until num_bank).foreach(x =>{
@@ -807,4 +815,3 @@ class operandCollector extends Module{
   io.out(1) <> issueUnit.io.out_x
   io.outMMA <> mmaCollector.mmaIssue
 }
-
