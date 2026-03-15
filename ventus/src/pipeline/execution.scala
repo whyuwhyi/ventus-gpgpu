@@ -421,6 +421,9 @@ class vALUexe extends Module{
   val alu=VecInit(Seq.fill(num_thread)((Module(new ScalarALU())).io))
   val result=Module(new Queue(new WriteVecCtrl,1,pipe=true))
   val result2simt=Module(new Queue(new vec_alu_bus,1,pipe=true))
+  val shuffleImm = io.in.bits.in1.head(4, 0)
+  val shuffleSrc = Wire(Vec(num_thread, UInt(xLen.W)))
+  shuffleSrc := io.in.bits.in2
   (0 until num_thread).foreach(x=>{
     alu(x).in1:=io.in.bits.in1(x)
     alu(x).in2:=io.in.bits.in2(x)
@@ -447,6 +450,26 @@ class vALUexe extends Module{
     when(io.in.bits.ctrl.alu_fn===FN_VMERGE){
       result.io.enq.bits.wb_wvd_rd(x):=Mux(io.in.bits.mask(x),io.in.bits.in1(x),io.in.bits.in2(x))
       result.io.enq.bits.wvd_mask(x):=true.B
+    }
+    when(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_IDX || io.in.bits.ctrl.alu_fn===FN_SHUFFLE_UP ||
+      io.in.bits.ctrl.alu_fn===FN_SHUFFLE_DOWN || io.in.bits.ctrl.alu_fn===FN_SHUFFLE_BFLY){
+      val laneIdx = x.U(log2Ceil(num_thread).W)
+      val srcIdx = WireDefault(laneIdx)
+      val validRange = WireDefault(true.B)
+      when(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_IDX){
+        srcIdx := shuffleImm
+      }.elsewhen(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_UP){
+        validRange := laneIdx >= shuffleImm
+        srcIdx := laneIdx - shuffleImm
+      }.elsewhen(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_DOWN){
+        val srcIdxWide = laneIdx +& shuffleImm
+        validRange := srcIdxWide < num_thread.U
+        srcIdx := srcIdxWide(log2Ceil(num_thread)-1, 0)
+      }.otherwise{
+        srcIdx := laneIdx ^ shuffleImm
+      }
+      val validSrc = validRange && io.in.bits.mask(srcIdx)
+      result.io.enq.bits.wb_wvd_rd(x) := Mux(validSrc, shuffleSrc(srcIdx), shuffleSrc(laneIdx))
     }
   })
   when(io.in.bits.ctrl.writemask){
@@ -504,6 +527,9 @@ class vALUv2(softThread: Int = num_thread, hardThread: Int = num_thread) extends
 
   val result = Module(new Queue(new WriteVecCtrl2, 1, pipe = true))
   val result2simt = Module(new Queue(new vec_alu_bus2, 1, pipe = true))
+  val shuffleImm = io.in.bits.in1.head(4, 0)
+  val shuffleSrc = Wire(Vec(softThread, UInt(xLen.W)))
+  shuffleSrc := io.in.bits.in2
   //==========================================
   if(softThread == hardThread){
     (0 until num_thread).foreach(x => {
@@ -541,6 +567,26 @@ class vALUv2(softThread: Int = num_thread, hardThread: Int = num_thread) extends
         result.io.enq.bits.wb_wvd_rd(x) := Mux(io.in.bits.mask(x), io.in.bits.in1(x), io.in.bits.in2(x))
         result.io.enq.bits.wvd_mask(x) := true.B
       }
+      when(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_IDX || io.in.bits.ctrl.alu_fn===FN_SHUFFLE_UP ||
+        io.in.bits.ctrl.alu_fn===FN_SHUFFLE_DOWN || io.in.bits.ctrl.alu_fn===FN_SHUFFLE_BFLY) {
+        val laneIdx = x.U(log2Ceil(softThread).W)
+        val srcIdx = WireDefault(laneIdx)
+        val validRange = WireDefault(true.B)
+        when(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_IDX) {
+          srcIdx := shuffleImm
+        }.elsewhen(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_UP) {
+          validRange := laneIdx >= shuffleImm
+          srcIdx := laneIdx - shuffleImm
+        }.elsewhen(io.in.bits.ctrl.alu_fn===FN_SHUFFLE_DOWN) {
+          val srcIdxWide = laneIdx +& shuffleImm
+          validRange := srcIdxWide < softThread.U
+          srcIdx := srcIdxWide(log2Ceil(softThread)-1, 0)
+        }.otherwise {
+          srcIdx := laneIdx ^ shuffleImm
+        }
+        val validSrc = validRange && io.in.bits.mask(srcIdx)
+        result.io.enq.bits.wb_wvd_rd(x) := Mux(validSrc, shuffleSrc(srcIdx), shuffleSrc(laneIdx))
+      }
     })
     when(io.in.bits.ctrl.writemask) {
       result.io.enq.bits.wb_wvd_rd(0) := Mux(io.in.bits.ctrl.readmask, alu(0).out, VecInit((0 until num_thread).map(x => {
@@ -576,6 +622,9 @@ class vALUv2(softThread: Int = num_thread, hardThread: Int = num_thread) extends
 
     val inReg = Reg(new vExeData2)
     val hardResult = VecInit.fill(softThread)(0.U(xLen.W))
+    val shuffleSrcReg = Reg(Vec(softThread, UInt(xLen.W)))
+    val shuffleMaskReg = Reg(Vec(softThread, Bool()))
+    val shuffleImmReg = Reg(UInt(5.W))
     val resultReg = Reg(new WriteVecCtrl2)
     val simtReg = Reg(new vec_alu_bus2)
     val outFIFOReady = Mux(inReg.ctrl.simt_stack, result2simt.io.enq.ready, result.io.enq.ready)
@@ -616,6 +665,9 @@ class vALUv2(softThread: Int = num_thread, hardThread: Int = num_thread) extends
       is(1.U){
         when(io.in.fire){
           inReg := io.in.bits
+          shuffleSrcReg := io.in.bits.in2
+          shuffleMaskReg := io.in.bits.mask
+          shuffleImmReg := io.in.bits.in1.head(4, 0)
         }
       }
       is((2 to maxIter).map{_.U}){
@@ -727,6 +779,26 @@ class vALUv2(softThread: Int = num_thread, hardThread: Int = num_thread) extends
       }
       when(inReg.ctrl.alu_fn === FN_VMERGE) {
         hardResult(x) := Mux(inReg.mask(x), inReg.in1(x), inReg.in2(x))
+      }
+      when(inReg.ctrl.alu_fn===FN_SHUFFLE_IDX || inReg.ctrl.alu_fn===FN_SHUFFLE_UP ||
+        inReg.ctrl.alu_fn===FN_SHUFFLE_DOWN || inReg.ctrl.alu_fn===FN_SHUFFLE_BFLY) {
+        val laneIdx = Mux(sendCS === 0.U, x.U, (sendCS - 1.U) * hardThread.U + x.U)
+        val srcIdx = WireDefault(laneIdx)
+        val validRange = WireDefault(true.B)
+        when(inReg.ctrl.alu_fn===FN_SHUFFLE_IDX) {
+          srcIdx := shuffleImmReg
+        }.elsewhen(inReg.ctrl.alu_fn===FN_SHUFFLE_UP) {
+          validRange := laneIdx >= shuffleImmReg
+          srcIdx := laneIdx - shuffleImmReg
+        }.elsewhen(inReg.ctrl.alu_fn===FN_SHUFFLE_DOWN) {
+          val srcIdxWide = laneIdx +& shuffleImmReg
+          validRange := srcIdxWide < softThread.U
+          srcIdx := srcIdxWide(log2Ceil(softThread)-1, 0)
+        }.otherwise {
+          srcIdx := laneIdx ^ shuffleImmReg
+        }
+        val validSrc = validRange && shuffleMaskReg(srcIdx)
+        hardResult(x) := Mux(validSrc, shuffleSrcReg(srcIdx), shuffleSrcReg(laneIdx))
       }
     }
     result.io.enq.valid := recvCS===maxIter.U && recv_wvd && !recv_simt_stack
@@ -1060,4 +1132,3 @@ class UNFUexe extends Module{
     }
   }
 }
-
