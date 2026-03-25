@@ -48,6 +48,33 @@ extern "C" void ventus_rtlsim_finish(ventus_rtlsim_t* sim, bool snapshot_rollbac
 extern "C" const ventus_rtlsim_step_result_t* ventus_rtlsim_step(ventus_rtlsim_t* sim) { return sim->step(); }
 extern "C" void ventus_rtlsim_icache_invalidate(ventus_rtlsim_t* sim) { sim->need_icache_invalidate = true; }
 extern "C" uint64_t ventus_rtlsim_get_time(const ventus_rtlsim_t* sim) { return sim->contextp->time(); }
+extern "C" uint64_t ventus_rtlsim_get_cycle_counter(const ventus_rtlsim_t* sim) {
+    return sim->dut->io_cnt;
+}
+extern "C" void ventus_rtlsim_get_perf_counters(
+    const ventus_rtlsim_t* sim, ventus_rtlsim_perf_counters_t* out_counters
+) {
+    if (sim == nullptr || out_counters == nullptr)
+        return;
+    *out_counters = ventus_rtlsim_perf_counters_t{
+        .sm_active_cycles = sim->dut->io_perf_sm_active_cycles,
+        .sm_eligible_cycles = sim->dut->io_perf_sm_eligible_cycles,
+        .issue_scalar_inst = sim->dut->io_perf_issue_scalar_inst,
+        .issue_vector_inst = sim->dut->io_perf_issue_vector_inst,
+        .issue_vector_lanes = sim->dut->io_perf_issue_vector_lanes,
+        .scoreboard_stall_cycles = sim->dut->io_perf_scoreboard_stall_cycles,
+        .barrier_stall_cycles = sim->dut->io_perf_barrier_stall_cycles,
+        .lsu_backpressure_cycles = sim->dut->io_perf_lsu_backpressure_cycles,
+        .dcache_read_miss = sim->dut->io_perf_dcache_read_miss,
+        .dcache_write_miss = sim->dut->io_perf_dcache_write_miss,
+        .mshr_full_stall_cycles = sim->dut->io_perf_mshr_full_stall_cycles,
+        .shared_bank_conflict_cycles = sim->dut->io_perf_shared_bank_conflict_cycles,
+        .mma_issue_count = sim->dut->io_perf_mma_issue_count,
+        .mma_busy_cycles = sim->dut->io_perf_mma_busy_cycles,
+        .unfu_issue_count = sim->dut->io_perf_unfu_issue_count,
+        .unfu_busy_cycles = sim->dut->io_perf_unfu_busy_cycles,
+    };
+}
 extern "C" bool ventus_rtlsim_is_idle(const ventus_rtlsim_t* sim) { return sim->cta->is_idle(); }
 
 extern "C" void ventus_rtlsim_add_kernel__delay_data_loading(

@@ -58,7 +58,7 @@ class Writeback(num_x:Int,num_v:Int) extends Module{
     x
   }
   val arbiter_x=Module(new Arbiter(new WriteScalarCtrl(),num_x))
-  val arbiter_v=Module(new Arbiter(new WriteVecCtrl(),num_v))
+  val arbiter_v=Module(new RRArbiter(new WriteVecCtrl(),num_v))
   arbiter_x.io.in<>fifo_x
   arbiter_v.io.in<>fifo_v
   arbiter_x.io.out<>io.out_x

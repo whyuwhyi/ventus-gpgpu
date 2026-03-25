@@ -80,20 +80,18 @@ class GPGPU_SimWrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = Non
     val cnt = Output(UInt(32.W))
     val inst_cnt = if(INST_CNT) Some(Output(Vec(num_sm, UInt(32.W)))) else None
     val inst_cnt2 = if(INST_CNT_2) Some(Output(Vec(num_sm, Vec(2, UInt(32.W))))) else None
+    val perf = Output(new PerfCounters)
     val icache_invalidate = Input(Bool())
   })
 
-  val counter = new Counter(200000)
-  counter.reset()
-  when(true.B){
-    counter.inc()
-  }
-  io.cnt := counter.value
+  val counter = RegInit(0.U(32.W))
+  counter := counter + 1.U
+  io.cnt := counter
 
   val GPU = Module(new GPGPU_top()(L1param, FakeCache, SV))
   GPU.suggestName("GPU")
 
-  GPU.io.cycle_cnt := counter.value
+  GPU.io.cycle_cnt := counter
   if(MMU_ENABLED){
     GPU.io.asid_fill.foreach{ _ <> io.asid_fill.get }
   }
@@ -112,4 +110,5 @@ class GPGPU_SimWrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = Non
 
   if(INST_CNT) io.inst_cnt.foreach{_ := GPU.io.inst_cnt.getOrElse(0.U) }
   if(INST_CNT_2) io.inst_cnt2.foreach{_ := GPU.io.inst_cnt2.getOrElse(0.U) }
+  io.perf := GPU.io.perf
 }

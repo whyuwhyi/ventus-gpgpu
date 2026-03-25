@@ -186,6 +186,7 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
     val out_d=Flipped(Vec(NL2Cache,Decoupled(new TLBundleD_lite(l2cache_params))))
     val inst_cnt = if(INST_CNT) Some(Output(Vec(NSms, UInt(32.W)))) else None
     val inst_cnt2 = if(INST_CNT_2) Some(Output(Vec(NSms, Vec(2, UInt(32.W))))) else None
+    val perf = Output(new PerfCounters)
     val cycle_cnt = Input(UInt(20.W))
     val asid_fill = if(MMU_ENABLED) Some(Input(Flipped(ValidIO(new mmu.AsidLookupEntry(SV.get))))) else None
     val icache_invalidate = Input(Bool())
@@ -342,6 +343,7 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   io.host_req<>cta.io.host2CTA
   io.inst_cnt.foreach(_.zipWithIndex.foreach{case (l,r) => l := sm_wrapper(r).inst_cnt.getOrElse(0.U)})
   io.inst_cnt2.foreach(_.zipWithIndex.foreach{case (l,r) => l := sm_wrapper(r).inst_cnt2.getOrElse(0.U)})
+  io.perf := sm_wrapper.map(_.perf).reduceLeft(PerfCounters.add)
 
   for(i <- 0 until NL2Cache){
     val port = l2cache(i).in_a
@@ -380,6 +382,7 @@ class SM_wrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = None) ext
     val icache_invalidate = Input(Bool())
     //val inst_cnt = if(INST_CNT) Some(Output(UInt(32.W))) else None
     val inst_cnt2 = if(INST_CNT_2) Some(Output(Vec(2, UInt(32.W)))) else None
+    val perf = Output(new PerfCounters)
   })
   val cta2warp=Module(new CTA2warp)
   cta2warp.io.CTAreq<>io.CTAreq
@@ -389,6 +392,7 @@ class SM_wrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = None) ext
   pipe.io.pc_reset:=true.B
   io.inst_cnt.foreach(_ := pipe.io.inst_cnt.getOrElse(0.U))
   io.inst_cnt2.foreach( _ := pipe.io.inst_cnt2.getOrElse(0.U))
+  val perfOut = WireDefault(pipe.io.perf)
   val cnt=Counter(10)
   when(cnt.value<5.U){cnt.inc()}
   when(cnt.value===5.U){pipe.io.pc_reset:=false.B}
@@ -465,6 +469,9 @@ class SM_wrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = None) ext
   pipe.io.dcache_rsp.bits.activeMask:=dcache.io.coreRsp.bits.activeMask
   //pipe.io.dcache_rsp.bits.isWrite:=dcache.io.coreRsp.bits.isWrite
   dcache.io.coreRsp.ready:=pipe.io.dcache_rsp.ready
+  perfOut.dcache_read_miss := dcache.io.perf_dcache_read_miss
+  perfOut.dcache_write_miss := dcache.io.perf_dcache_write_miss
+  perfOut.mshr_full_stall_cycles := dcache.io.perf_mshr_full_stall_cycles
 
   assert(num_cache_in_sm == 2, "Now only support 2 L1 Caches(one L1I and one L1D) in a single SM")
 if(MMU_ENABLED) {
@@ -530,6 +537,8 @@ if(MMU_ENABLED) {
   pipe.io.shared_rsp.bits.instrId:=sharedmem.io.coreRsp.bits.instrId
   pipe.io.shared_rsp.bits.activeMask:=sharedmem.io.coreRsp.bits.activeMask
   // pipe.io.shared_rsp.bits.isWrite:=sharedmem.io.coreRsp.bits.isWrite
+  perfOut.shared_bank_conflict_cycles := sharedmem.io.perf_shared_bank_conflict_cycles
+  io.perf := perfOut
   
   if(GVM_ENABLED){
     val WF_ID_WIDTH = log2Ceil(num_warp_in_a_block)

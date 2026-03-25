@@ -4,7 +4,7 @@ ifneq ($(words $(CURDIR)),1)
 endif
 export MAKEFLAGS += +r
 
-RELEASE ?= 0
+RELEASE ?= 1
 PREFIX ?= $(CURDIR)/install
 
 export RTL_GVM_ENABLED = false
@@ -80,7 +80,7 @@ VLIB_OBJ_EXPORT = $(VLIB_SRC_CXX_EXPORT:%.cpp=$(VLIB_DIR_BUILDOBJ)/%.o)
 
 # Verilated model parallelism config
 VLIB_NPROC_CPU = $(shell nproc)
-VLIB_NPROC_DUT = 8 # Depends on RTL circuit size, just try and find a verilator-allowed largest number
+VLIB_NPROC_DUT = 8 # Depends on RTL circuit size; 15 causes V3TSP internal error
 VLIB_NPROC_SIM = $(call MIN_FUNC, $(VLIB_NPROC_CPU), $(VLIB_NPROC_DUT))
 VLIB_NPROC_TRACE_FST = $(call MIN_FUNC, $(VLIB_NPROC_SIM), 2)
 
@@ -100,12 +100,19 @@ VLIB_VERILATOR_FLAGS += -Wno-WIDTHEXPAND
 VLIB_VERILATOR_FLAGS += -Wno-WIDTHTRUNC
 # Define macros for Verilog
 # random init
+ifeq ($(TRACE),1)
 VLIB_VERILATOR_FLAGS += -DPRINTF_COND=1
+else
+VLIB_VERILATOR_FLAGS += -DPRINTF_COND=0
+endif
 VLIB_VERILATOR_FLAGS += -DRANDOMIZE
 VLIB_VERILATOR_FLAGS += -DRANDOMIZE_MEM_INIT
 VLIB_VERILATOR_FLAGS += -DRANDOMIZE_REG_INIT
-# Make waveforms
+# Make waveforms (disabled for speed; re-enable with TRACE=1)
+TRACE ?= 0
+ifeq ($(TRACE),1)
 VLIB_VERILATOR_FLAGS += --trace-fst
+endif
 # Check SystemVerilog assertions
 VLIB_VERILATOR_FLAGS += --assert
 # Generate coverage analysis
@@ -123,15 +130,21 @@ endif
 VLIB_CFLAGS += -fPIC
 VLIB_CXXFLAGS += $(VLIB_CFLAGS)
 VLIB_CXXFLAGS += -std=c++20
+ifeq ($(RELEASE),1)
+VLIB_CXXFLAGS += -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_ERROR
+else
 VLIB_CXXFLAGS += -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
+endif
 VLIB_LDFLAGS += -lc
 ifeq ($(MOLD),1)
 VLIB_LDFLAGS += -fuse-ld=mold
 endif
 
-VLIB_VERILATOR_FLAGS += --threads 2
-VLIB_VERILATOR_FLAGS += --trace-threads 1
-VLIB_VERILATOR_FLAGS += -j 20
+VLIB_VERILATOR_FLAGS += --threads $(VLIB_NPROC_SIM)
+ifeq ($(TRACE),1)
+VLIB_VERILATOR_FLAGS += --trace-threads $(VLIB_NPROC_TRACE_FST)
+endif
+VLIB_VERILATOR_FLAGS += -j $(VLIB_NPROC_CPU)
 VLIB_VERILATOR_FLAGS += -CFLAGS "$(VLIB_CXXFLAGS)"
 VLIB_VERILATOR_FLAGS += -LDFLAGS "$(VLIB_LDFLAGS)"
 VLIB_VERILATOR_FLAGS += --prefix Vdut -Mdir $(VLIB_DIR_BUILDOBJ)

@@ -188,6 +188,7 @@ object MMADecode {
   def alayout(inst: UInt): Bool = inst(14)
   def blayout(inst: UInt): Bool = inst(13)
   def cdtype(inst: UInt): UInt = inst(12)
+  def isLegal(inst: UInt): Bool = MMAWindowInfo.isLegal(shape(inst), abtype(inst), cdtype(inst))
 }
 
 object UNFUDecode {
@@ -646,6 +647,10 @@ class InstrDecodeV2 extends Module {
     val unfuSignals = ListLookup(io.inst(i), UNFUDecode.default, UNFUDecode.table)
     val isUnfuInst = unfuSignals(0).asBool
     val isMmaInst = MMADecode.isMma(io.inst(i))
+    when(maskAfterExt(i) && isMmaInst) {
+      assert(MMADecode.isLegal(io.inst(i)),
+        "illegal MMA encoding: TF32 must use k8 shapes and FP32 accumulate; BF16 must use FP32 accumulate")
+    }
     val isVecDecoded = s(0).asBool || isUnfuInst || isMmaInst
     if(MMU_ENABLED) {
       c.asid.get := DontCare

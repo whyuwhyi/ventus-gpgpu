@@ -544,6 +544,7 @@ class LSUexe() extends Module{
     val csr_pds = Input(UInt(xLen.W))
     val csr_numw = Input(UInt(xLen.W))
     val csr_tid = Input(UInt(xLen.W))
+    val perf_lsu_backpressure_cycles = Output(UInt(64.W))
   })
   val sharedmemory_addr_max = sharemem_size.U(32.W)
   //val sharedmemory = Module(new SharedMemoryV2(nSharedMemoryEntry, num_thread, xLen, lsu_nMshrEntry)) // default: 128
@@ -570,6 +571,7 @@ class LSUexe() extends Module{
   io.lsu_rsp <> Coalscer.io.to_pipe
 
   val shiftBoard=VecInit(Seq.fill(num_warp)(Module(new ShiftBoard(lsu_num_entry_each_warp)).io))
+  val perfLsuBackpressureCycles = RegInit(0.U(64.W))
   shiftBoard.zipWithIndex.foreach{case(a,b)=> {
     a.left:=io.lsu_req.fire & io.lsu_req.bits.ctrl.wid===b.asUInt
     a.right:=io.lsu_rsp.fire & io.lsu_rsp.bits.tag.warp_id===b.asUInt
@@ -577,11 +579,15 @@ class LSUexe() extends Module{
   io.fence_end:=VecInit(shiftBoard.map(x=>x.empty)).asUInt
   io.lsu_req.ready:=Mux(shiftBoard(io.lsu_req.bits.ctrl.wid).full,false.B,InputFIFO.io.enq.ready)
   InputFIFO.io.enq.valid:=Mux(shiftBoard(io.lsu_req.bits.ctrl.wid).full,false.B,io.lsu_req.valid)
+  when(io.lsu_req.valid && !io.lsu_req.ready) {
+    perfLsuBackpressureCycles := perfLsuBackpressureCycles + 1.U
+  }
 
   io.csr_wid:=AddrCalc.io.csr_wid
   AddrCalc.io.csr_tid:=io.csr_tid
   AddrCalc.io.csr_pds:=io.csr_pds
   AddrCalc.io.csr_numw:=io.csr_numw
+  io.perf_lsu_backpressure_cycles := perfLsuBackpressureCycles
 }
 
 class ShiftBoard(val depth:Int) extends Module{

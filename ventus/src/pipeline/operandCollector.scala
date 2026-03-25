@@ -47,6 +47,7 @@ class issueIO extends Bundle{
 class MMACollectorUnit extends Module {
   val io = IO(new Bundle {
     val control = Flipped(Decoupled(new CtrlSigs))
+    val flush = Flipped(ValidIO(UInt(depth_warp.W)))
     val bankIn = Vec(4, Flipped(Decoupled(new crossbar2CU)))
     val mmaIssue = Decoupled(new MMAIssueData)
     val outArbiterIO = Vec(4, Decoupled(new CU2Arbiter))
@@ -112,7 +113,14 @@ class MMACollectorUnit extends Module {
     io.bankIn(i).ready := state === s_add
   }
 
-  when(state === s_idle) {
+  when(io.flush.valid && (state =/= s_idle) && (controlReg.wid === io.flush.bits)) {
+    state := s_idle
+    batchBase := 0.U
+    batchCount := 0.U
+    reqIssued.foreach(_ := false.B)
+    respDone.foreach(_ := false.B)
+    resetWindows()
+  }.elsewhen(state === s_idle) {
     when(io.control.fire) {
       controlReg := io.control.bits
       batchBase := 0.U
@@ -177,6 +185,7 @@ class collectorUnit extends Module{
     val bankIn = Vec(4, Flipped(Decoupled(new crossbar2CU)))
     //operand to be issued, alternatively vector and scalar
     val issue = Decoupled(new issueIO)
+    val flush = Flipped(ValidIO(UInt(depth_warp.W)))
     val outArbiterIO = Vec(4, Decoupled(new CU2Arbiter))
     val sgpr_base = Input(Vec(num_warp, UInt((SGPR_ID_WIDTH + 1).W)))
     val vgpr_base = Input(Vec(num_warp, UInt((VGPR_ID_WIDTH + 1).W)))
@@ -251,28 +260,33 @@ class collectorUnit extends Module{
     }
   }
   (0 until 4).foreach(i => {
-    io.bankIn(i).ready := (state === s_add  && (ready(i)===0.U)) || (io.control.fire && (readyWire(i)===0.U))
+    io.bankIn(i).ready :=
+      (state === s_add && valid(i) && !ready(i)) ||
+      (io.control.fire && (state === s_idle) && validWire(i) && !readyWire(i))
   })
   for (i <- 0 until 4) {
     io.outArbiterIO(i).valid :=
       MuxLookup(state, false.B)(
-        Array(s_idle->(io.control.fire && (readyWire(i)===0.U)),
-          s_add->((valid(i) === true.B) && (ready(i)===false.B))
+        Array(s_idle->(io.control.fire && validWire(i) && !readyWire(i)),
+          s_add->(valid(i) && !ready(i))
         ))
   }
   //  io.issue.valid := (valid.asUInt === ready.asUInt) && ready.asUInt.andR
   io.issue.valid := state===s_out
   io.control.ready := (state===s_idle && !valid.asUInt.orR)
 
-  when(state === s_idle) {
+  when(io.flush.valid && (state =/= s_idle) && (controlReg.wid === io.flush.bits)) {
+    state := s_idle
+    valid.foreach(_ := false.B)
+    ready.foreach(_ := false.B)
+  }.elsewhen(state === s_idle) {
 
     when(io.control.fire){
-      when(!readyWire.asUInt.andR) {state := s_add}
-        .elsewhen(readyWire.asUInt.andR) {state := s_out}
-        .otherwise{state := s_idle}
+      when((validWire.asUInt & (~readyWire.asUInt).asUInt).orR) {state := s_add}
+        .otherwise {state := s_out}
     }.otherwise{state := s_idle}
   }.elsewhen (state === s_add) {
-    when(valid.asUInt =/= ready.asUInt ) {
+    when((valid.asUInt & (~ready.asUInt).asUInt).orR) {
       state := s_add
       //    }.elsewhen(io.bankIn.fire){
       //      state := s_out
@@ -307,6 +321,15 @@ class collectorUnit extends Module{
       //      valid.foreach(_:=false.B)
       //      ready.foreach(_:=false.B)
       when(io.control.fire){
+        val needRead0 = io.control.bits.sel_alu1 === A1_RS1 || io.control.bits.sel_alu1 === A1_VRS1
+        val needRead1 = io.control.bits.sel_alu2 === A2_RS2 || io.control.bits.sel_alu2 === A2_VRS2
+        val needRead2 =
+          io.control.bits.sel_alu3 === A3_VRS3 ||
+          io.control.bits.sel_alu3 === A3_SD ||
+          io.control.bits.sel_alu3 === A3_FRS3 ||
+          (io.control.bits.sel_alu3 === A3_PC && io.control.bits.branch===B_R)
+        val needRead3 = io.control.bits.mask
+
         controlReg := io.control.bits
         //using an iterable variable to indicate reg_idx signals
         regIdxWire(0) := io.control.bits.reg_idx1
@@ -318,14 +341,22 @@ class collectorUnit extends Module{
             A3_SD -> Mux(io.control.bits.isvec & (!io.control.bits.readmask), io.control.bits.reg_idx3, io.control.bits.reg_idx2),
             A3_FRS3 -> io.control.bits.reg_idx3
           ))
-        regIdxWire(3) := 0.U // mask of vector instructions
+        regIdxWire(3) := 0.U // mask reads v0
         regIdx(0) := regIdxWire(0)
         regIdx(1) := regIdxWire(1)
         regIdx(2) := regIdxWire(2)
-        regIdx(3) := 0.U // mask of vector instructions
-        valid.foreach(_:= true.B)
-        validWire.foreach(_:=true.B)
+        regIdx(3) := 0.U // mask reads v0
+        valid.foreach(_:= false.B)
+        validWire.foreach(_:=false.B)
         ready.foreach(_:= false.B)
+        valid(0) := needRead0
+        valid(1) := needRead1
+        valid(2) := needRead2
+        valid(3) := needRead3
+        validWire(0) := needRead0
+        validWire(1) := needRead1
+        validWire(2) := needRead2
+        validWire(3) := needRead3
         //using an iterable variable to indicate sel_alu signals
         rsTypeWire(0) := io.control.bits.sel_alu1
         rsTypeWire(1) := io.control.bits.sel_alu2
@@ -336,7 +367,7 @@ class collectorUnit extends Module{
             A3_SD -> Mux(io.control.bits.isvec, 2.U, 1.U),
             A3_FRS3 -> 1.U
           ))
-        rsTypeWire(3) := 0.U(2.W) //mask
+        rsTypeWire(3) := Mux(io.control.bits.mask, 2.U, 0.U(2.W)) // mask comes from v0 in vector bank
         customCtrlWire := io.control.bits.custom_signal_0
         rsType(0) := rsTypeWire(0)
         rsType(1) := rsTypeWire(1)
@@ -345,7 +376,14 @@ class collectorUnit extends Module{
         customCtrlReg := customCtrlWire
         //if the operand1 or operand2 is an immediate, elaborate it and enable the ready bit
         //op1 is immediate or don't care
-        when(io.control.bits.sel_alu1 === A1_IMM) {
+        when(!needRead0){
+          rsReg(0).foreach(_:= imm.io.out)
+          when(io.control.bits.sel_alu1===A1_PC){
+            rsReg(0).foreach(_:= io.control.bits.pc)
+          }
+          ready(0) := true.B
+          readyWire(0) := true.B
+        }.elsewhen(io.control.bits.sel_alu1 === A1_IMM) {
           rsReg(0).foreach(_:= imm.io.out)
           ready(0) := 1.U
           readyWire(0) := 1.U
@@ -355,7 +393,14 @@ class collectorUnit extends Module{
           readyWire(0) := 1.U
         }
         //op2 is immediate or don't care
-        when(io.control.bits.sel_alu2===A2_IMM){
+        when(!needRead1){
+          rsReg(1).foreach(_ := 4.U)
+          when(io.control.bits.sel_alu2===A2_IMM){
+            rsReg(1).foreach(_:= imm.io.out)
+          }
+          ready(1) := true.B
+          readyWire(1) := true.B
+        }.elsewhen(io.control.bits.sel_alu2===A2_IMM){
           rsReg(1).foreach(_:= imm.io.out)
           ready(1) := 1.U
           readyWire(1) := 1.U
@@ -365,7 +410,11 @@ class collectorUnit extends Module{
           readyWire(1) := 1.U
         }
         //When op3 is not cared. See DecodeUnit.scala
-        when((io.control.bits.sel_alu3===A3_PC) && io.control.bits.branch=/=B_R){
+        when(!needRead2){
+          rsReg(2).foreach(_:= imm.io.out+io.control.bits.pc)
+          ready(2) := true.B
+          readyWire(2) := true.B
+        }.elsewhen((io.control.bits.sel_alu3===A3_PC) && io.control.bits.branch=/=B_R){
           rsReg(2).foreach(_:= imm.io.out+io.control.bits.pc)
           ready(2) := 1.U
           readyWire(2) := 1.U
@@ -445,6 +494,7 @@ class collectorUnit extends Module{
   io.issue.bits.alu_src2 := rsReg(1)
   io.issue.bits.alu_src3 := rsReg(2)
   io.issue.bits.mask := mask
+
 }
 
 /**
@@ -652,6 +702,7 @@ class operandCollector extends Module{
   val io=IO(new Bundle {
     val controlX=Flipped(Decoupled(new CtrlSigs()))
     val controlV=Flipped(Decoupled(new CtrlSigs()))
+    val flush=Flipped(ValidIO(UInt(depth_warp.W)))
     val out=Vec(2, Decoupled(new issueIO))
     val outMMA = Decoupled(new MMAIssueData)
     val writeScalarCtrl=Flipped(DecoupledIO(new WriteScalarCtrl)) //should be used as decoupledIO
@@ -716,9 +767,11 @@ class operandCollector extends Module{
   Demux.io.vgpr_baseIn := io.vgpr_base
   for(i <- 0 until num_collectorUnit){
     collectorUnits(i).control <> Demux.io.out(i)
+    collectorUnits(i).flush := io.flush
     collectorUnits(i).sgpr_base := Demux.io.sgpr_baseOut
     collectorUnits(i).vgpr_base := Demux.io.vgpr_baseOut
   }
+  mmaCollector.flush := io.flush
   mmaCollector.vgpr_base := Demux.io.vgpr_baseOut
 
   // writeback control

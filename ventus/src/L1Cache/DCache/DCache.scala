@@ -172,6 +172,9 @@ class DataCache(SV: Option[mmu.SVParam] = None)(implicit p: Parameters) extends 
     val memReq = if(MMU_ENABLED) Some(DecoupledIO(new DCacheMemReq_p)) else Some(DecoupledIO(new DCacheMemReq))
     val TLBRsp = if(MMU_ENABLED) Some(Flipped(DecoupledIO(new mmu.L1TlbRsp(SV.getOrElse(mmu.SV32))))) else None
     val TLBReq = if(MMU_ENABLED) Some(DecoupledIO(new mmu.L1TlbReq(SV.getOrElse(mmu.SV32)))) else None
+    val perf_dcache_read_miss = Output(UInt(64.W))
+    val perf_dcache_write_miss = Output(UInt(64.W))
+    val perf_mshr_full_stall_cycles = Output(UInt(64.W))
   })
 
   // ******     important submodules     ******
@@ -242,6 +245,19 @@ class DataCache(SV: Option[mmu.SVParam] = None)(implicit p: Parameters) extends 
   val readMiss_st1 = cacheMiss_st1 & coreReqControl_st1_Q.io.deq.bits.isRead & coreReqControl_st1_Q.io.deq.valid//coreReqControl_st1_Q.io.deq.fire
   val writeHit_st1 = cacheHit_st1 & coreReqControl_st1_Q.io.deq.bits.isWrite & coreReqControl_st1_Q.io.deq.fire
   val writeMiss_st1 = cacheMiss_st1 & coreReqControl_st1_Q.io.deq.bits.isWrite & coreReqControl_st1_Q.io.deq.fire
+  val perfDcacheReadMiss = RegInit(0.U(64.W))
+  val perfDcacheWriteMiss = RegInit(0.U(64.W))
+  val perfMshrFullStallCycles = RegInit(0.U(64.W))
+  when(readMiss_st1) {
+    perfDcacheReadMiss := perfDcacheReadMiss + 1.U
+  }
+  when(writeMiss_st1) {
+    perfDcacheWriteMiss := perfDcacheWriteMiss + 1.U
+  }
+  when(io.coreReq.valid && !io.coreReq.ready &&
+    ((MshrAccess.io.mshrStatus_st0 === 3.U) || (MshrAccess.io.mshrStatus_st0 === 1.U))) {
+    perfMshrFullStallCycles := perfMshrFullStallCycles + 1.U
+  }
 
   val coreRsp_st2 =Module(new Queue(new DCacheCoreRsp_d,1,true,false))//Reg(new DCacheCoreRsp)
   val coreRsp_st2_valid =Wire(Bool())
@@ -920,6 +936,9 @@ class DataCache(SV: Option[mmu.SVParam] = None)(implicit p: Parameters) extends 
     memReq_valid := memReq_Q.io.deq.fire
   }
   io.memReq.get.valid := memReq_valid
+  io.perf_dcache_read_miss := perfDcacheReadMiss
+  io.perf_dcache_write_miss := perfDcacheWriteMiss
+  io.perf_mshr_full_stall_cycles := perfMshrFullStallCycles
 }
 
 /** coreReq hit场景中DataAccess以word为粒度的SRAM bank使能信号

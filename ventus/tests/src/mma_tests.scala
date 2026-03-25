@@ -95,7 +95,8 @@ class MMADotArrayTest extends AnyFreeSpec with ChiselScalatestTester {
       }
       dut.io.in.bits.c(0).poke(0.U)
       dut.io.in.bits.c(1).poke(0.U)
-      dut.io.in.bits.abtype.poke(0.U)
+      dut.io.in.bits.shape.poke(pipeline.MMAConst.ShapeM8N8K16.U)
+      dut.io.in.bits.abtype.poke(pipeline.MMAConst.ABTypeFP16.U)
       dut.io.in.bits.cdtype.poke(1.U)
       dut.io.out.ready.poke(true.B)
       while (!dut.io.in.ready.peek().litToBoolean) {
@@ -114,7 +115,6 @@ class MMADotArrayTest extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 }
-
 
 class MMAFragmentCanonicalizerTest extends AnyFreeSpec with ChiselScalatestTester {
   "decode row/col layouts into canonical A/B/C tiles" in {

@@ -39,6 +39,9 @@ class warp_scheduler extends Module{
     //val ldst = Input(new warp_schedule_ldst_io()) // assume finish l2cache request
     //val switch = Input(Bool()) // assume coming from LDST unit (or other unit)
     val flushDCache = Decoupled(Bool())
+    val perf_sm_active_cycles = Output(UInt(64.W))
+    val perf_sm_eligible_cycles = Output(UInt(64.W))
+    val perf_barrier_stall_cycles = Output(UInt(64.W))
     // val inquire_csr_wid = Output(UInt(depth_warp.W))
     // val inquire_csr_addr = Output(UInt(12.W))
     // val inquire_csr_data = Input(UInt(xLen.W))
@@ -174,12 +177,24 @@ class warp_scheduler extends Module{
 
 
   val warp_active=RegInit(0.U(num_warp.W))
+  val perfSmActiveCycles = RegInit(0.U(64.W))
+  val perfSmEligibleCycles = RegInit(0.U(64.W))
+  val perfBarrierStallCycles = RegInit(0.U(64.W))
 
 
 
   warp_active:=(warp_active | ((1.U<<io.warpReq.bits.wid).asUInt&Fill(num_warp,io.warpReq.fire))) & (~( Fill(num_warp,warp_end)&(1.U<<warp_end_id).asUInt )).asUInt
   val warp_ready=(~(warp_bar_data | io.scoreboard_busy | io.exe_busy | (~warp_active).asUInt)).asUInt
   io.warp_ready:=warp_ready
+  when(warp_active.orR) {
+    perfSmActiveCycles := perfSmActiveCycles + 1.U
+  }
+  when(warp_ready.orR) {
+    perfSmEligibleCycles := perfSmEligibleCycles + 1.U
+  }
+  when(warp_active.orR && warp_bar_data.orR) {
+    perfBarrierStallCycles := perfBarrierStallCycles + 1.U
+  }
   for (i<- num_warp-1 to 0 by -1){
     pc_ready(i):= io.pc_ibuffer_ready(i) & warp_active(i) 
     when(pc_ready(i)){next_warp:=i.asUInt}
@@ -219,4 +234,7 @@ class warp_scheduler extends Module{
     pcControl.zipWithIndex.foreach{case(x,b)=>{x.PC_src:=1.U;x.New_PC:=warp_init_addr(b);x.PC_replay:=false.B} }
     io.pc_req.valid:=false.B
   }
+  io.perf_sm_active_cycles := perfSmActiveCycles
+  io.perf_sm_eligible_cycles := perfSmEligibleCycles
+  io.perf_barrier_stall_cycles := perfBarrierStallCycles
 }

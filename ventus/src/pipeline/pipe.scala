@@ -13,6 +13,7 @@ package pipeline
 import L1Cache.ICache._
 import chisel3._
 import chisel3.util._
+import top.PerfCounters
 import top.parameters._
 import gvm._
 
@@ -48,6 +49,7 @@ class pipe() extends Module{
     val inst = if (SINGLE_INST) Some(Flipped(DecoupledIO(UInt(32.W)))) else None
     val inst_cnt = if(INST_CNT) Some(Output(UInt(32.W))) else if(INST_CNT_2) Some(Output(Vec(2, UInt(32.W)))) else None
     val inst_cnt2 = if(INST_CNT_2) Some(Output(Vec(2, UInt(32.W)))) else None
+    val perf = Output(new PerfCounters)
   })
   val issue_stall=Wire(Bool())
   val flush=Wire(Bool())
@@ -96,6 +98,10 @@ class pipe() extends Module{
   val wb=Module(new Writeback(6,9))
 
   val inst_cnt_xv = RegInit(VecInit(0.U(32.W), 0.U(32.W)))
+  val perfIssueScalarInst = RegInit(0.U(64.W))
+  val perfIssueVectorInst = RegInit(0.U(64.W))
+  val perfIssueVectorLanes = RegInit(0.U(64.W))
+  val perfScoreboardStallCycles = RegInit(0.U(64.W))
   if(INST_CNT_2){
     when(issueX.io.in.fire){
       when(issueV.io.in.fire && !issueV.io.in.bits.ctrl.isvec){
@@ -112,6 +118,7 @@ class pipe() extends Module{
   }
 
   val scoreb=VecInit(Seq.fill(num_warp)(Module(new Scoreboard).io))
+  val scoreboardBusy = VecInit(scoreb.map(_.delay)).asUInt
   val ibuffer=Module(new InstrBufferV2)
   val ibuffer2issue=Module(new ibuffer2issue)
   if(INST_CNT) {
@@ -170,7 +177,7 @@ class pipe() extends Module{
   warp_sche.io.warp_control<>issueX.io.out_warpscheduler
   warp_sche.io.issued_warp.bits:=exe_dataX.io.enq.bits.ctrl.wid // not used
   warp_sche.io.issued_warp.valid:=exe_dataX.io.enq.fire // not used
-  warp_sche.io.scoreboard_busy:=(VecInit(scoreb.map(_.delay))).asUInt
+  warp_sche.io.scoreboard_busy:=scoreboardBusy
 
   csrfile.io.CTA2csr:=warp_sche.io.CTA2csr
   val init_thread_mask = (1.U(num_thread.W) << warp_sche.io.CTA2csr.bits.CTAdata.dispatch2cu_wf_size_dispatch).asUInt - 1.U
@@ -271,15 +278,21 @@ class pipe() extends Module{
     when(warp_sche.io.branch.fire&(warp_sche.io.branch.bits.wid===i.asUInt)){scoreb(i).br_ctrl:=true.B}.
       elsewhen(warp_sche.io.warp_control.fire&(warp_sche.io.warp_control.bits.ctrl.wid===i.asUInt)){scoreb(i).br_ctrl:=true.B}.
       elsewhen(simt_stack.io.complete.valid&(simt_stack.io.complete.bits===i.asUInt)){scoreb(i).br_ctrl:=true.B}
+    when(warp_sche.io.flush.valid && (warp_sche.io.flush.bits===i.asUInt)){
+      scoreb(i).op_colX_out_fire := true.B
+      scoreb(i).op_colV_out_fire := true.B
+    }
   }
   val op_colV_in_wid = Wire(UInt(depth_warp.W))
-  val op_colV_out_wid = Wire(UInt(depth_warp.W))
   val op_colX_in_wid = Wire(UInt(depth_warp.W))
   val op_colX_out_wid = Wire(UInt(depth_warp.W))
   op_colV_in_wid := operand_collector.io.controlV.bits.wid
-  op_colV_out_wid := Mux(operand_collector.io.outMMA.fire, operand_collector.io.outMMA.bits.ctrl.wid, operand_collector.io.out(0).bits.control.wid)
   scoreb(op_colV_in_wid).op_colV_in_fire:=operand_collector.io.controlV.fire
-  scoreb(op_colV_out_wid).op_colV_out_fire:=operand_collector.io.out(0).fire || operand_collector.io.outMMA.fire
+  for (i <- 0 until num_warp) {
+    scoreb(i).op_colV_out_fire :=
+      (operand_collector.io.out(0).fire && operand_collector.io.out(0).bits.control.wid === i.U) ||
+      (operand_collector.io.outMMA.fire && operand_collector.io.outMMA.bits.ctrl.wid   === i.U)
+  }
 
   op_colX_in_wid := operand_collector.io.controlX.bits.wid
   op_colX_out_wid := operand_collector.io.out(1).bits.control.wid
@@ -306,6 +319,7 @@ class pipe() extends Module{
 
   operand_collector.io.controlV<>ibuffer2issue.io.out_v//ibuffer2issue.io.out.bits
   operand_collector.io.controlX<>ibuffer2issue.io.out_x//ibuffer2issue.io.out.bits
+  operand_collector.io.flush := warp_sche.io.flush
   operand_collector.io.writeVecCtrl<>wb.io.out_v
   operand_collector.io.writeScalarCtrl<>wb.io.out_x
   operand_collector.io.outMMA.ready := mmaexe.io.in.ready
@@ -454,4 +468,36 @@ class pipe() extends Module{
   wb.io.in_v(8)<>csrfile.io.out_v
 
   issue_stall:=(~issueX.io.in.ready).asBool | (~issueV.io.in.ready).asBool//scoreb.io.delay | issue.io.in.ready
+
+  when(issueX.io.in.fire) {
+    perfIssueScalarInst := perfIssueScalarInst + 1.U
+  }
+  when(issueV.io.in.fire && !issueV.io.in.bits.ctrl.isvec) {
+    perfIssueScalarInst := perfIssueScalarInst + 1.U
+  }
+  when(issueV.io.in.fire && issueV.io.in.bits.ctrl.isvec) {
+    perfIssueVectorInst := perfIssueVectorInst + 1.U
+    perfIssueVectorLanes := perfIssueVectorLanes + PopCount(issueV.io.in.bits.mask)
+  }
+  when(scoreboardBusy.orR) {
+    perfScoreboardStallCycles := perfScoreboardStallCycles + 1.U
+  }
+
+  io.perf := PerfCounters.zero
+  io.perf.sm_active_cycles := warp_sche.io.perf_sm_active_cycles
+  io.perf.sm_eligible_cycles := warp_sche.io.perf_sm_eligible_cycles
+  io.perf.issue_scalar_inst := perfIssueScalarInst
+  io.perf.issue_vector_inst := perfIssueVectorInst
+  io.perf.issue_vector_lanes := perfIssueVectorLanes
+  io.perf.scoreboard_stall_cycles := perfScoreboardStallCycles
+  io.perf.barrier_stall_cycles := warp_sche.io.perf_barrier_stall_cycles
+  io.perf.lsu_backpressure_cycles := lsu.io.perf_lsu_backpressure_cycles
+  io.perf.dcache_read_miss := 0.U
+  io.perf.dcache_write_miss := 0.U
+  io.perf.mshr_full_stall_cycles := 0.U
+  io.perf.shared_bank_conflict_cycles := 0.U
+  io.perf.mma_issue_count := mmaexe.io.perf_mma_issue_count
+  io.perf.mma_busy_cycles := mmaexe.io.perf_mma_busy_cycles
+  io.perf.unfu_issue_count := unfu.io.perf_unfu_issue_count
+  io.perf.unfu_busy_cycles := unfu.io.perf_unfu_busy_cycles
 }

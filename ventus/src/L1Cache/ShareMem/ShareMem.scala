@@ -56,10 +56,12 @@ class SharedMemory(implicit p: Parameters) extends ShareMemModule{
   val io = IO(new Bundle{
     val coreReq = Flipped(DecoupledIO(new ShareMemCoreReq))
     val coreRsp = DecoupledIO(new ShareMemCoreRsp)
+    val perf_shared_bank_conflict_cycles = Output(UInt(64.W))
     })
 
   // ******     important submodules     ******
   val BankConfArb = Module(new BankConflictArbiter)
+  val perfSharedBankConflictCycles = RegInit(0.U(64.W))
   //val TagAccess = Module(new L1TagAccess(set=NSets, way=NWays, tagBits=TagBits))
   val DataCorssBarForWrite = Module(new DataCrossbar)
   val DataCorssBarForRead = Module(new DataCrossbar)
@@ -79,6 +81,9 @@ class SharedMemory(implicit p: Parameters) extends ShareMemModule{
   BankConfArb.io.coreReqArb.enable := io.coreReq.fire
   BankConfArb.io.coreReqArb.isWrite := Mux(RegNext(BankConfArb.io.bankConflict),coreReq_st1.isWrite,io.coreReq.bits.isWrite)
   BankConfArb.io.coreReqArb.perLaneAddr := io.coreReq.bits.perLaneAddr
+  when(BankConfArb.io.bankConflict) {
+    perfSharedBankConflictCycles := perfSharedBankConflictCycles + 1.U
+  }
 
   // ******      valid write      ******
   // crossbar switch for perWord addr
@@ -192,4 +197,5 @@ class SharedMemory(implicit p: Parameters) extends ShareMemModule{
   // ******      core req ready
   //coreReq_ok_to_in := MshrAccess.io.missReq.ready && !missRspFromMshr_st2 && !io.memRsp.valid && coreRsp_Q.io.enq.ready && !Arbiter.io.bankConflict
   io.coreReq.ready := !RegNext(BankConfArb.io.bankConflict) && !coreRsp_QAlmstFull && !coreReqisValidWrite_st1
+  io.perf_shared_bank_conflict_cycles := perfSharedBankConflictCycles
 }

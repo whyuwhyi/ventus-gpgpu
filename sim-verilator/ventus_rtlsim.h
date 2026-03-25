@@ -18,6 +18,25 @@ extern "C" {
 typedef struct ventus_rtlsim_t ventus_rtlsim_t;
 typedef uint64_t paddr_t;
 
+typedef struct ventus_rtlsim_perf_counters_t {
+    uint64_t sm_active_cycles;
+    uint64_t sm_eligible_cycles;
+    uint64_t issue_scalar_inst;
+    uint64_t issue_vector_inst;
+    uint64_t issue_vector_lanes;
+    uint64_t scoreboard_stall_cycles;
+    uint64_t barrier_stall_cycles;
+    uint64_t lsu_backpressure_cycles;
+    uint64_t dcache_read_miss;
+    uint64_t dcache_write_miss;
+    uint64_t mshr_full_stall_cycles;
+    uint64_t shared_bank_conflict_cycles;
+    uint64_t mma_issue_count;
+    uint64_t mma_busy_cycles;
+    uint64_t unfu_issue_count;
+    uint64_t unfu_busy_cycles;
+} ventus_rtlsim_perf_counters_t;
+
 typedef struct ventus_kernel_metadata_t {
     // Additional data
     const char* name; // kernel name
@@ -100,6 +119,11 @@ typedef struct {
 DLL_PUBLIC void ventus_rtlsim_get_default_config(ventus_rtlsim_config_t* config);
 // Get current simulation time.
 DLL_PUBLIC uint64_t ventus_rtlsim_get_time(const ventus_rtlsim_t* sim);
+// Get the RTL-exposed cycle counter from GPGPU_SimWrapper.io.cnt.
+DLL_PUBLIC uint64_t ventus_rtlsim_get_cycle_counter(const ventus_rtlsim_t* sim);
+DLL_PUBLIC void ventus_rtlsim_get_perf_counters(
+    const ventus_rtlsim_t* sim, ventus_rtlsim_perf_counters_t* out_counters
+);
 // Check if the simulated GPU is idle (no kernel is running).
 DLL_PUBLIC bool ventus_rtlsim_is_idle(const ventus_rtlsim_t* sim);
 // Get RTL parameters (output from *out_value, return 0 on success)

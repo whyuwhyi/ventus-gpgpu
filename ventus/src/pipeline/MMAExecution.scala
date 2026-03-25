@@ -51,35 +51,46 @@ class MMAFragmentCanonicalizer extends Module {
     window(reg)(lane)
   }
 
-  io.out.mDim := MuxLookup(io.in.shape, 16.U(5.W))(Seq(
-    MMAConst.ShapeM8N8K16.U -> 8.U(5.W),
-    MMAConst.ShapeM16N8K16.U -> 16.U(5.W),
-    MMAConst.ShapeM8N16K16.U -> 8.U(5.W),
-    MMAConst.ShapeM16N16K16.U -> 16.U(5.W)
-  ))
-  io.out.nDim := MuxLookup(io.in.shape, 16.U(5.W))(Seq(
-    MMAConst.ShapeM8N8K16.U -> 8.U(5.W),
-    MMAConst.ShapeM16N8K16.U -> 8.U(5.W),
-    MMAConst.ShapeM8N16K16.U -> 16.U(5.W),
-    MMAConst.ShapeM16N16K16.U -> 16.U(5.W)
-  ))
+  io.out.mDim := MMAWindowInfo.mDim(io.in.shape)
+  io.out.nDim := MMAWindowInfo.nDim(io.in.shape)
 
   val mIs16 = io.out.mDim === 16.U
   val nIs16 = io.out.nDim === 16.U
+  val kIs8 = MMAWindowInfo.isK8Shape(io.in.shape)
+  val kLimit = MMAWindowInfo.kDim(io.in.shape)
+  val isTF32 = io.in.abtype === MMAConst.ABTypeTF32.U
 
   for (m <- 0 until 16) {
     for (k <- 0 until 16) {
-      val rowMajorA = packed16(io.in.aWindow, m * 16 + k)
-      val colMajorA = Mux(mIs16, packed16(io.in.aWindow, k * 16 + m), packed16(io.in.aWindow, k * 8 + m))
-      io.out.a(m)(k) := Mux(io.in.alayout, colMajorA, rowMajorA)
+      val fpRowMajorA = packed16(io.in.aWindow, m * 16 + k)
+      val fpColMajorA = Mux(kIs8, packed16(io.in.aWindow, k * 16 + m),
+        Mux(mIs16, packed16(io.in.aWindow, k * 16 + m), packed16(io.in.aWindow, k * 8 + m)))
+      val tf32RowElemA = packed32(io.in.aWindow, m * 8 + (k / 2))
+      val tf32ColElemA = Mux(mIs16, packed32(io.in.aWindow, (k / 2) * 16 + m), packed32(io.in.aWindow, (k / 2) * 8 + m))
+      val tf32RowMajorA = if ((k & 1) == 0) tf32RowElemA(15, 0) else tf32RowElemA(31, 16)
+      val tf32ColMajorA = if ((k & 1) == 0) tf32ColElemA(15, 0) else tf32ColElemA(31, 16)
+      val fpVal = Mux(io.in.alayout, fpColMajorA, fpRowMajorA)
+      val tf32Val = Mux(io.in.alayout, tf32ColMajorA, tf32RowMajorA)
+      io.out.a(m)(k) := Mux(m.U < io.out.mDim,
+        Mux(isTF32, tf32Val, Mux(k.U < kLimit, fpVal, 0.U(16.W))),
+        0.U(16.W))
     }
   }
 
   for (n <- 0 until 16) {
     for (k <- 0 until 16) {
-      val rowMajorB = packed16(io.in.bWindow, n * 16 + k)
-      val colMajorB = Mux(nIs16, packed16(io.in.bWindow, k * 16 + n), packed16(io.in.bWindow, k * 8 + n))
-      io.out.b(n)(k) := Mux(io.in.blayout, rowMajorB, colMajorB)
+      val fpRowMajorB = packed16(io.in.bWindow, n * 16 + k)
+      val fpColMajorB = Mux(kIs8, packed16(io.in.bWindow, k * 16 + n),
+        Mux(nIs16, packed16(io.in.bWindow, k * 16 + n), packed16(io.in.bWindow, k * 8 + n)))
+      val tf32RowElemB = packed32(io.in.bWindow, n * 8 + (k / 2))
+      val tf32ColElemB = Mux(nIs16, packed32(io.in.bWindow, (k / 2) * 16 + n), packed32(io.in.bWindow, (k / 2) * 8 + n))
+      val tf32RowMajorB = if ((k & 1) == 0) tf32RowElemB(15, 0) else tf32RowElemB(31, 16)
+      val tf32ColMajorB = if ((k & 1) == 0) tf32ColElemB(15, 0) else tf32ColElemB(31, 16)
+      val fpVal = Mux(io.in.blayout, fpRowMajorB, fpColMajorB)
+      val tf32Val = Mux(io.in.blayout, tf32RowMajorB, tf32ColMajorB)
+      io.out.b(n)(k) := Mux(n.U < io.out.nDim,
+        Mux(isTF32, tf32Val, Mux(k.U < kLimit, fpVal, 0.U(16.W))),
+        0.U(16.W))
     }
   }
 
@@ -98,6 +109,7 @@ class MMADotArrayInput(arrayM: Int, arrayN: Int) extends Bundle {
   val vecA = Vec(arrayM, Vec(16, UInt(16.W)))
   val vecB = Vec(arrayN, Vec(16, UInt(16.W)))
   val c = Vec(arrayM * arrayN, UInt(32.W))
+  val shape = UInt(3.W)
   val abtype = UInt(4.W)
   val cdtype = UInt(1.W)
 }
@@ -114,7 +126,11 @@ class MMADotArray(arrayM: Int, arrayN: Int) extends Module {
   })
 
   val lanes = Seq.fill(arrayM * arrayN)(Module(new FDA_HP))
-  val isBF16 = io.in.bits.abtype === MMAConst.ABTypeBF16.U
+  val dataType = io.in.bits.abtype(1, 0)
+  when(io.in.valid) {
+    assert(MMAWindowInfo.isLegal(io.in.bits.shape, io.in.bits.abtype, io.in.bits.cdtype),
+      "illegal MMA input: TF32 requires k8 + FP32 accumulate; BF16 requires FP32 accumulate")
+  }
 
   lanes.zipWithIndex.foreach { case (lane, idx) =>
     val row = idx / arrayN
@@ -123,7 +139,7 @@ class MMADotArray(arrayM: Int, arrayN: Int) extends Module {
     lane.io.in.bits := 0.U.asTypeOf(new FDA_HPInput(lane.config))
     lane.io.in.bits.vecA := io.in.bits.vecA(row)
     lane.io.in.bits.vecB := io.in.bits.vecB(col)
-    lane.io.in.bits.dataType := isBF16
+    lane.io.in.bits.dataType := dataType
     lane.io.in.bits.c := io.in.bits.c(idx)
     lane.io.in.bits.accType := io.in.bits.cdtype
     io.out.bits.result(idx) := lane.io.out.bits.result
@@ -134,14 +150,20 @@ class MMADotArray(arrayM: Int, arrayN: Int) extends Module {
   io.out.valid := lanes.map(_.io.out.valid).reduce(_ && _)
 }
 
-class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
+class vMMAexe(arrayM: Int = 8, arrayN: Int = 8) extends Module {
   require(num_thread == 32, "warp-level MMA currently requires 32 threads")
   val io = IO(new Bundle {
     val in = Flipped(Decoupled(new MMAIssueData))
     val out_v = Decoupled(new WriteVecCtrl)
+    val perf_mma_issue_count = Output(UInt(64.W))
+    val perf_mma_busy_cycles = Output(UInt(64.W))
   })
 
   val dataBuffer = Queue(io.in, 1)
+  when(dataBuffer.valid) {
+    assert(MMAWindowInfo.isLegal(dataBuffer.bits.ctrl.mma_shape, dataBuffer.bits.ctrl.mma_abtype, dataBuffer.bits.ctrl.mma_cdtype),
+      "illegal MMA control: TF32 requires k8 + FP32 accumulate; BF16 requires FP32 accumulate")
+  }
   val canonicalizer = Module(new MMAFragmentCanonicalizer)
   canonicalizer.io.in.shape := dataBuffer.bits.ctrl.mma_shape
   canonicalizer.io.in.abtype := dataBuffer.bits.ctrl.mma_abtype
@@ -160,6 +182,8 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
   val colBase = RegInit(0.U(5.W))
   val drainIdx = RegInit(0.U(4.W))
   val resultTile = RegInit(VecInit(Seq.fill(16)(VecInit(Seq.fill(16)(0.U(xLen.W))))))
+  val perfMmaIssueCount = RegInit(0.U(64.W))
+  val perfMmaBusyCycles = RegInit(0.U(64.W))
 
   val mDim = canonicalizer.io.out.mDim
   val nDim = canonicalizer.io.out.nDim
@@ -170,19 +194,20 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
   dotArray.io.out.ready := false.B
   for (r <- 0 until arrayM) {
     for (k <- 0 until 16) {
-      dotArray.io.in.bits.vecA(r)(k) := canonicalizer.io.out.a(rowBase + r.U)(k)
+      dotArray.io.in.bits.vecA(r)(k) := canonicalizer.io.out.a((rowBase + r.U)(3, 0))(k)
     }
   }
   for (c <- 0 until arrayN) {
     for (k <- 0 until 16) {
-      dotArray.io.in.bits.vecB(c)(k) := canonicalizer.io.out.b(colBase + c.U)(k)
+      dotArray.io.in.bits.vecB(c)(k) := canonicalizer.io.out.b((colBase + c.U)(3, 0))(k)
     }
   }
   for (r <- 0 until arrayM) {
     for (c <- 0 until arrayN) {
-      dotArray.io.in.bits.c(r * arrayN + c) := canonicalizer.io.out.c(rowBase + r.U)(colBase + c.U)
+      dotArray.io.in.bits.c(r * arrayN + c) := canonicalizer.io.out.c((rowBase + r.U)(3, 0))((colBase + c.U)(3, 0))
     }
   }
+  dotArray.io.in.bits.shape := dataBuffer.bits.ctrl.mma_shape
   dotArray.io.in.bits.abtype := dataBuffer.bits.ctrl.mma_abtype
   dotArray.io.in.bits.cdtype := dataBuffer.bits.ctrl.mma_cdtype
 
@@ -196,12 +221,18 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
     io.out_v.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
   }
   io.out_v.bits.wvd_mask.foreach(_ := true.B)
+  when(io.in.fire) {
+    perfMmaIssueCount := perfMmaIssueCount + 1.U
+  }
+  when(state =/= sIdle) {
+    perfMmaBusyCycles := perfMmaBusyCycles + 1.U
+  }
 
   val flatElemsPerReg = Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, 32.U, 64.U)
   val totalElems = mDim * nDim
   def compactElem(idx: UInt): UInt = {
-    val row = Mux(nDim === 16.U, idx >> 4, idx >> 3)
-    val col = Mux(nDim === 16.U, idx(3, 0), idx(2, 0))
+    val row = Mux(nDim === 16.U, (idx >> 4)(3, 0), (idx >> 3)(3, 0))
+    val col = Mux(nDim === 16.U, idx(3, 0), Cat(0.U(1.W), idx(2, 0)))
     resultTile(row)(col)
   }
   for (lane <- 0 until num_thread) {
@@ -239,7 +270,7 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
         for (r <- 0 until arrayM) {
           for (c <- 0 until arrayN) {
             when((rowBase + r.U) < mDim && (colBase + c.U) < nDim) {
-              resultTile(rowBase + r.U)(colBase + c.U) := dotArray.io.out.bits.result(r * arrayN + c)
+              resultTile((rowBase + r.U)(3, 0))((colBase + c.U)(3, 0)) := dotArray.io.out.bits.result(r * arrayN + c)
             }
           }
         }
@@ -266,4 +297,6 @@ class vMMAexe(arrayM: Int = 2, arrayN: Int = 1) extends Module {
       }
     }
   }
+  io.perf_mma_issue_count := perfMmaIssueCount
+  io.perf_mma_busy_cycles := perfMmaBusyCycles
 }

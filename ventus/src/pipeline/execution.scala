@@ -1022,6 +1022,8 @@ class UNFUexe extends Module{
     val in = Flipped(DecoupledIO(new vExeData()))
     val out_x = DecoupledIO(new WriteScalarCtrl())
     val out_v = DecoupledIO(new WriteVecCtrl)
+    val perf_unfu_issue_count = Output(UInt(64.W))
+    val perf_unfu_busy_cycles = Output(UInt(64.W))
   })
 
   val unfu = Seq.fill(num_sfu)(Module(new UNFUModule))
@@ -1031,6 +1033,8 @@ class UNFUexe extends Module{
   val issueValid = RegInit(false.B)
   val mask = RegInit(0.U(num_thread.W))
   val outData = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
+  val perfUnfuIssueCount = RegInit(0.U(64.W))
+  val perfUnfuBusyCycles = RegInit(0.U(64.W))
 
   val numGrp = num_thread / num_sfu
   val maskGrp = Wire(Vec(numGrp, Bool()))
@@ -1063,6 +1067,12 @@ class UNFUexe extends Module{
   val allOutValid = laneOutValid.asUInt.andR
   val issueFire = state === sBusy && issueValid && allInReady
   val collectFire = state === sBusy && !issueValid && allOutValid
+  when(io.in.fire) {
+    perfUnfuIssueCount := perfUnfuIssueCount + 1.U
+  }
+  when(state =/= sIdle) {
+    perfUnfuBusyCycles := perfUnfuBusyCycles + 1.U
+  }
 
   for (i <- 0 until num_sfu) {
     unfu(i).io.in.valid := issueFire && laneMask(i)
@@ -1131,4 +1141,6 @@ class UNFUexe extends Module{
       }
     }
   }
+  io.perf_unfu_issue_count := perfUnfuIssueCount
+  io.perf_unfu_busy_cycles := perfUnfuBusyCycles
 }
