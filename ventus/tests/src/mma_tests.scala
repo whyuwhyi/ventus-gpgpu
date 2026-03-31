@@ -206,4 +206,73 @@ class MMAExecutionTest extends AnyFreeSpec with ChiselScalatestTester {
       assert(beats == 2)
     }
   }
+
+  "keep mma sub-tile issue close to II=1 instead of waiting full dot-array latency between tiles" in {
+    test(new pipeline.vMMAexe()) { dut =>
+      def driveCommonInput(shape: UInt, regIdx: Int): Unit = {
+        dut.io.in.valid.poke(true.B)
+        dut.io.in.bits.ctrl.mma.poke(true.B)
+        dut.io.in.bits.ctrl.mma_shape.poke(shape)
+        dut.io.in.bits.ctrl.mma_abtype.poke(pipeline.MMAConst.ABTypeFP16.U)
+        dut.io.in.bits.ctrl.mma_cdtype.poke(pipeline.MMAConst.CDTypeFP32.U)
+        dut.io.in.bits.ctrl.mma_alayout.poke(false.B)
+        dut.io.in.bits.ctrl.mma_blayout.poke(true.B)
+        dut.io.in.bits.ctrl.reg_idxw.poke(regIdx.U)
+        dut.io.in.bits.ctrl.wid.poke(0.U)
+        for (reg <- 0 until pipeline.MMAConst.MaxARegs) {
+          for (lane <- 0 until 32) {
+            dut.io.in.bits.aWindow(reg)(lane).poke("h3c003c00".U)
+          }
+        }
+        for (reg <- 0 until pipeline.MMAConst.MaxBRegs) {
+          for (lane <- 0 until 32) {
+            dut.io.in.bits.bWindow(reg)(lane).poke("h3c003c00".U)
+          }
+        }
+        for (reg <- 0 until pipeline.MMAConst.MaxCDRegs) {
+          for (lane <- 0 until 32) {
+            dut.io.in.bits.cWindow(reg)(lane).poke(0.U)
+          }
+        }
+      }
+
+      def measureFirstBeatLatency(shape: Int, regIdx: Int): Int = {
+        val cdRegs = pipeline.MMAWindowInfo.srcCDRegs(shape, pipeline.MMAConst.CDTypeFP32)
+        dut.io.out_v.ready.poke(true.B)
+        while (!dut.io.in.ready.peek().litToBoolean) {
+          dut.clock.step()
+        }
+        driveCommonInput(shape.U, regIdx)
+        dut.clock.step()
+        dut.io.in.valid.poke(false.B)
+
+        var cycles = 0
+        var beats = 0
+        var firstBeatLatency = -1
+        while (beats < cdRegs && cycles < 512) {
+          if (dut.io.out_v.valid.peek().litToBoolean) {
+            if (firstBeatLatency < 0) {
+              firstBeatLatency = cycles
+            }
+            beats += 1
+          }
+          dut.clock.step()
+          cycles += 1
+        }
+        assert(firstBeatLatency >= 0, s"mma shape $shape never produced writeback")
+        assert(beats == cdRegs, s"mma shape $shape drained $beats/$cdRegs writeback beats")
+        firstBeatLatency
+      }
+
+      val singleTileLatency = measureFirstBeatLatency(pipeline.MMAConst.ShapeM8N8K16, regIdx = 12)
+      val fourTileLatency = measureFirstBeatLatency(pipeline.MMAConst.ShapeM16N16K16, regIdx = 16)
+      val extraCycles = fourTileLatency - singleTileLatency
+
+      assert(
+        extraCycles <= 6,
+        s"MMA wrapper inserted too many bubbles between sub-tiles: single=$singleTileLatency fourTile=$fourTileLatency extra=$extraCycles"
+      )
+    }
+  }
+
 }

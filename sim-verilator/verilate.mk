@@ -141,6 +141,7 @@ VLIB_LDFLAGS += -fuse-ld=mold
 endif
 
 VLIB_VERILATOR_FLAGS += --threads $(VLIB_NPROC_SIM)
+VLIB_VERILATOR_FLAGS += -Wno-UNOPTTHREADS
 ifeq ($(TRACE),1)
 VLIB_VERILATOR_FLAGS += --trace-threads $(VLIB_NPROC_TRACE_FST)
 endif

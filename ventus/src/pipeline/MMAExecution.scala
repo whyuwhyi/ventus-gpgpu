@@ -150,6 +150,163 @@ class MMADotArray(arrayM: Int, arrayN: Int) extends Module {
   io.out.valid := lanes.map(_.io.out.valid).reduce(_ && _)
 }
 
+class MMASlotAlloc extends Bundle {
+  val ctrl = new CtrlSigs()
+  val a = Vec(16, Vec(16, UInt(16.W)))
+  val b = Vec(16, Vec(16, UInt(16.W)))
+  val c = Vec(16, Vec(16, UInt(32.W)))
+}
+
+class MMASlotIssue(arrayM: Int, arrayN: Int) extends Bundle {
+  val rowBase = UInt(5.W)
+  val colBase = UInt(5.W)
+  val vecA = Vec(arrayM, Vec(16, UInt(16.W)))
+  val vecB = Vec(arrayN, Vec(16, UInt(16.W)))
+  val c = Vec(arrayM * arrayN, UInt(32.W))
+  val shape = UInt(3.W)
+  val abtype = UInt(4.W)
+  val cdtype = UInt(1.W)
+  val lastTile = Bool()
+}
+
+class MMASlotCollect(arrayM: Int, arrayN: Int) extends Bundle {
+  val rowBase = UInt(5.W)
+  val colBase = UInt(5.W)
+  val result = Vec(arrayM * arrayN, UInt(32.W))
+}
+
+class MMASlot(arrayM: Int, arrayN: Int) extends Module {
+  val io = IO(new Bundle {
+    val alloc = Flipped(DecoupledIO(new MMASlotAlloc))
+    val issue = DecoupledIO(new MMASlotIssue(arrayM, arrayN))
+    val collect = Flipped(ValidIO(new MMASlotCollect(arrayM, arrayN)))
+    val drain = DecoupledIO(new WriteVecCtrl)
+    val active = Output(Bool())
+  })
+
+  def totalTiles(shape: UInt): UInt = {
+    val mDim = MMAWindowInfo.mDim(shape)
+    val nDim = MMAWindowInfo.nDim(shape)
+    val rows = (mDim + (arrayM - 1).U) / arrayM.U
+    val cols = (nDim + (arrayN - 1).U) / arrayN.U
+    rows * cols
+  }
+
+  val validReg = RegInit(false.B)
+  val ctrlReg = Reg(new CtrlSigs())
+  val aReg = Reg(Vec(16, Vec(16, UInt(16.W))))
+  val bReg = Reg(Vec(16, Vec(16, UInt(16.W))))
+  val resultTileReg = Reg(Vec(16, Vec(16, UInt(xLen.W))))
+  val issueRowBaseReg = RegInit(0.U(5.W))
+  val issueColBaseReg = RegInit(0.U(5.W))
+  val issueRemainingReg = RegInit(0.U(3.W))
+  val collectPendingReg = RegInit(0.U(3.W))
+  val drainIdxReg = RegInit(0.U(4.W))
+  val doneReg = RegInit(false.B)
+
+  val mDim = MMAWindowInfo.mDim(ctrlReg.mma_shape)
+  val nDim = MMAWindowInfo.nDim(ctrlReg.mma_shape)
+  val cdRegs = MMAWindowInfo.srcCDRegs(ctrlReg.mma_shape, ctrlReg.mma_cdtype)
+
+  io.alloc.ready := !validReg
+  io.issue.valid := validReg && issueRemainingReg.orR
+  io.issue.bits.rowBase := issueRowBaseReg
+  io.issue.bits.colBase := issueColBaseReg
+  io.issue.bits.shape := ctrlReg.mma_shape
+  io.issue.bits.abtype := ctrlReg.mma_abtype
+  io.issue.bits.cdtype := ctrlReg.mma_cdtype
+  io.issue.bits.lastTile := issueRemainingReg === 1.U
+  for (r <- 0 until arrayM) {
+    for (k <- 0 until 16) {
+      io.issue.bits.vecA(r)(k) := aReg((issueRowBaseReg + r.U)(3, 0))(k)
+    }
+  }
+  for (c <- 0 until arrayN) {
+    for (k <- 0 until 16) {
+      io.issue.bits.vecB(c)(k) := bReg((issueColBaseReg + c.U)(3, 0))(k)
+    }
+  }
+  for (r <- 0 until arrayM) {
+    for (c <- 0 until arrayN) {
+      io.issue.bits.c(r * arrayN + c) := resultTileReg((issueRowBaseReg + r.U)(3, 0))((issueColBaseReg + c.U)(3, 0))
+    }
+  }
+
+  io.drain.valid := validReg && doneReg
+  io.drain.bits.warp_id := ctrlReg.wid
+  io.drain.bits.reg_idxw := ctrlReg.reg_idxw + drainIdxReg
+  io.drain.bits.wvd := ctrlReg.wvd
+  io.drain.bits.wvd_mask.foreach(_ := true.B)
+  if (SPIKE_OUTPUT) {
+    io.drain.bits.spike_info.get := ctrlReg.spike_info.get
+  }
+  val flatElemsPerReg = Mux(ctrlReg.mma_cdtype === MMAConst.CDTypeFP32.U, 32.U, 64.U)
+  val totalElems = mDim * nDim
+  def compactElem(idx: UInt): UInt = {
+    val row = Mux(nDim === 16.U, (idx >> 4)(3, 0), (idx >> 3)(3, 0))
+    val col = Mux(nDim === 16.U, idx(3, 0), Cat(0.U(1.W), idx(2, 0)))
+    resultTileReg(row)(col)
+  }
+  for (lane <- 0 until num_thread) {
+    val baseIdx = drainIdxReg * flatElemsPerReg + Mux(ctrlReg.mma_cdtype === MMAConst.CDTypeFP32.U, lane.U, (lane * 2).U)
+    val nextIdx = baseIdx + 1.U
+    val baseValid = baseIdx < totalElems
+    val nextValid = nextIdx < totalElems
+    val fp32Val = Mux(baseValid, compactElem(baseIdx), 0.U)
+    val fp16Lo = Mux(baseValid, compactElem(baseIdx)(15, 0), 0.U(16.W))
+    val fp16Hi = Mux(nextValid, compactElem(nextIdx)(15, 0), 0.U(16.W))
+    io.drain.bits.wb_wvd_rd(lane) := Mux(ctrlReg.mma_cdtype === MMAConst.CDTypeFP32.U, fp32Val, Cat(fp16Hi, fp16Lo))
+  }
+
+  when(io.alloc.fire) {
+    validReg := true.B
+    ctrlReg := io.alloc.bits.ctrl
+    aReg := io.alloc.bits.a
+    bReg := io.alloc.bits.b
+    resultTileReg := io.alloc.bits.c
+    issueRowBaseReg := 0.U
+    issueColBaseReg := 0.U
+    issueRemainingReg := totalTiles(io.alloc.bits.ctrl.mma_shape)
+    collectPendingReg := totalTiles(io.alloc.bits.ctrl.mma_shape)
+    drainIdxReg := 0.U
+    doneReg := !totalTiles(io.alloc.bits.ctrl.mma_shape).orR
+  }
+  when(io.issue.fire) {
+    val nextRow = issueRowBaseReg + arrayM.U
+    val wrapRows = nextRow >= mDim
+    issueRowBaseReg := Mux(wrapRows, 0.U, nextRow)
+    issueColBaseReg := Mux(wrapRows, issueColBaseReg + arrayN.U, issueColBaseReg)
+    issueRemainingReg := issueRemainingReg - 1.U
+  }
+  when(io.collect.valid) {
+    for (r <- 0 until arrayM) {
+      for (c <- 0 until arrayN) {
+        when((io.collect.bits.rowBase + r.U) < mDim && (io.collect.bits.colBase + c.U) < nDim) {
+          resultTileReg((io.collect.bits.rowBase + r.U)(3, 0))((io.collect.bits.colBase + c.U)(3, 0)) :=
+            io.collect.bits.result(r * arrayN + c)
+        }
+      }
+    }
+    collectPendingReg := collectPendingReg - 1.U
+    when(collectPendingReg === 1.U) {
+      doneReg := true.B
+    }
+  }
+  when(io.drain.fire) {
+    when(drainIdxReg + 1.U >= cdRegs) {
+      validReg := false.B
+      issueRemainingReg := 0.U
+      collectPendingReg := 0.U
+      drainIdxReg := 0.U
+      doneReg := false.B
+    }.otherwise {
+      drainIdxReg := drainIdxReg + 1.U
+    }
+  }
+
+  io.active := validReg
+}
+
 class vMMAexe(arrayM: Int = 8, arrayN: Int = 8) extends Module {
   require(num_thread == 32, "warp-level MMA currently requires 32 threads")
   val io = IO(new Bundle {
@@ -159,144 +316,101 @@ class vMMAexe(arrayM: Int = 8, arrayN: Int = 8) extends Module {
     val perf_mma_busy_cycles = Output(UInt(64.W))
   })
 
-  val dataBuffer = Queue(io.in, 1)
-  when(dataBuffer.valid) {
-    assert(MMAWindowInfo.isLegal(dataBuffer.bits.ctrl.mma_shape, dataBuffer.bits.ctrl.mma_abtype, dataBuffer.bits.ctrl.mma_cdtype),
+  val maxInflight = 2
+  val slotIdxWidth = scala.math.max(1, log2Ceil(maxInflight))
+  class TileMeta extends Bundle {
+    val slotIdx = UInt(slotIdxWidth.W)
+    val rowBase = UInt(5.W)
+    val colBase = UInt(5.W)
+  }
+
+  when(io.in.valid) {
+    assert(MMAWindowInfo.isLegal(io.in.bits.ctrl.mma_shape, io.in.bits.ctrl.mma_abtype, io.in.bits.ctrl.mma_cdtype),
       "illegal MMA control: TF32 requires k8 + FP32 accumulate; BF16 requires FP32 accumulate")
   }
-  val canonicalizer = Module(new MMAFragmentCanonicalizer)
-  canonicalizer.io.in.shape := dataBuffer.bits.ctrl.mma_shape
-  canonicalizer.io.in.abtype := dataBuffer.bits.ctrl.mma_abtype
-  canonicalizer.io.in.cdtype := dataBuffer.bits.ctrl.mma_cdtype
-  canonicalizer.io.in.alayout := dataBuffer.bits.ctrl.mma_alayout
-  canonicalizer.io.in.blayout := dataBuffer.bits.ctrl.mma_blayout
-  canonicalizer.io.in.aWindow := dataBuffer.bits.aWindow
-  canonicalizer.io.in.bWindow := dataBuffer.bits.bWindow
-  canonicalizer.io.in.cWindow := dataBuffer.bits.cWindow
 
+  val allocCanonicalizer = Module(new MMAFragmentCanonicalizer)
+  allocCanonicalizer.io.in.shape := io.in.bits.ctrl.mma_shape
+  allocCanonicalizer.io.in.abtype := io.in.bits.ctrl.mma_abtype
+  allocCanonicalizer.io.in.cdtype := io.in.bits.ctrl.mma_cdtype
+  allocCanonicalizer.io.in.alayout := io.in.bits.ctrl.mma_alayout
+  allocCanonicalizer.io.in.blayout := io.in.bits.ctrl.mma_blayout
+  allocCanonicalizer.io.in.aWindow := io.in.bits.aWindow
+  allocCanonicalizer.io.in.bWindow := io.in.bits.bWindow
+  allocCanonicalizer.io.in.cWindow := io.in.bits.cWindow
+
+  val slots = Seq.fill(maxInflight)(Module(new MMASlot(arrayM, arrayN)))
   val dotArray = Module(new MMADotArray(arrayM, arrayN))
-
-  val sIdle :: sIssue :: sWait :: sDrain :: Nil = Enum(4)
-  val state = RegInit(sIdle)
-  val rowBase = RegInit(0.U(5.W))
-  val colBase = RegInit(0.U(5.W))
-  val drainIdx = RegInit(0.U(4.W))
-  val resultTile = RegInit(VecInit(Seq.fill(16)(VecInit(Seq.fill(16)(0.U(xLen.W))))))
+  val tileMetaQ = Module(new Queue(new TileMeta, maxInflight * 4, pipe = true))
+  val drainArb = Module(new RRArbiter(new WriteVecCtrl, maxInflight))
   val perfMmaIssueCount = RegInit(0.U(64.W))
   val perfMmaBusyCycles = RegInit(0.U(64.W))
+  val currentIssueSlot = RegInit(0.U(slotIdxWidth.W))
 
-  val mDim = canonicalizer.io.out.mDim
-  val nDim = canonicalizer.io.out.nDim
-  val cdRegs = MMAWindowInfo.srcCDRegs(dataBuffer.bits.ctrl.mma_shape, dataBuffer.bits.ctrl.mma_cdtype)
+  val allocReadyVec = VecInit(slots.map(_.io.alloc.ready)).asUInt
+  val allocIdx = PriorityEncoder(allocReadyVec)
+  io.in.ready := allocReadyVec.orR
+  val allocBits = Wire(new MMASlotAlloc)
+  allocBits.ctrl := io.in.bits.ctrl
+  allocBits.a := allocCanonicalizer.io.out.a
+  allocBits.b := allocCanonicalizer.io.out.b
+  allocBits.c := allocCanonicalizer.io.out.c
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.alloc.valid := io.in.valid && allocReadyVec.orR && allocIdx === idx.U
+    slot.io.alloc.bits := allocBits
+  }
 
-  dotArray.io.in.valid := false.B
+  val issueValidVec = VecInit(slots.map(_.io.issue.valid)).asUInt
+  val currentIssueOH = UIntToOH(currentIssueSlot, maxInflight).asUInt
+  val selectedIssueOH = Mux((issueValidVec & currentIssueOH).orR, currentIssueOH, PriorityEncoderOH(issueValidVec))
+  val selectedIssueValid = selectedIssueOH.orR
+  val selectedIssueIdx = OHToUInt(selectedIssueOH)
+  val selectedIssue = Mux1H(selectedIssueOH, slots.map(_.io.issue.bits))
+
+  dotArray.io.in.valid := selectedIssueValid && tileMetaQ.io.enq.ready
   dotArray.io.in.bits := 0.U.asTypeOf(new MMADotArrayInput(arrayM, arrayN))
-  dotArray.io.out.ready := false.B
-  for (r <- 0 until arrayM) {
-    for (k <- 0 until 16) {
-      dotArray.io.in.bits.vecA(r)(k) := canonicalizer.io.out.a((rowBase + r.U)(3, 0))(k)
-    }
+  dotArray.io.in.bits.vecA := selectedIssue.vecA
+  dotArray.io.in.bits.vecB := selectedIssue.vecB
+  dotArray.io.in.bits.c := selectedIssue.c
+  dotArray.io.in.bits.shape := selectedIssue.shape
+  dotArray.io.in.bits.abtype := selectedIssue.abtype
+  dotArray.io.in.bits.cdtype := selectedIssue.cdtype
+  val issueFire = dotArray.io.in.fire
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.issue.ready := issueFire && selectedIssueIdx === idx.U
   }
-  for (c <- 0 until arrayN) {
-    for (k <- 0 until 16) {
-      dotArray.io.in.bits.vecB(c)(k) := canonicalizer.io.out.b((colBase + c.U)(3, 0))(k)
-    }
-  }
-  for (r <- 0 until arrayM) {
-    for (c <- 0 until arrayN) {
-      dotArray.io.in.bits.c(r * arrayN + c) := canonicalizer.io.out.c((rowBase + r.U)(3, 0))((colBase + c.U)(3, 0))
-    }
-  }
-  dotArray.io.in.bits.shape := dataBuffer.bits.ctrl.mma_shape
-  dotArray.io.in.bits.abtype := dataBuffer.bits.ctrl.mma_abtype
-  dotArray.io.in.bits.cdtype := dataBuffer.bits.ctrl.mma_cdtype
+  tileMetaQ.io.enq.valid := issueFire
+  tileMetaQ.io.enq.bits.slotIdx := selectedIssueIdx
+  tileMetaQ.io.enq.bits.rowBase := selectedIssue.rowBase
+  tileMetaQ.io.enq.bits.colBase := selectedIssue.colBase
 
-  dataBuffer.ready := false.B
-  io.out_v.valid := false.B
-  io.out_v.bits := 0.U.asTypeOf(new WriteVecCtrl)
-  io.out_v.bits.warp_id := dataBuffer.bits.ctrl.wid
-  io.out_v.bits.reg_idxw := dataBuffer.bits.ctrl.reg_idxw + drainIdx
-  io.out_v.bits.wvd := true.B
-  if (SPIKE_OUTPUT) {
-    io.out_v.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
+  val collectPayload = Wire(new MMASlotCollect(arrayM, arrayN))
+  collectPayload.rowBase := tileMetaQ.io.deq.bits.rowBase
+  collectPayload.colBase := tileMetaQ.io.deq.bits.colBase
+  collectPayload.result := dotArray.io.out.bits.result
+  val collectFire = tileMetaQ.io.deq.valid && dotArray.io.out.valid
+  dotArray.io.out.ready := tileMetaQ.io.deq.valid
+  tileMetaQ.io.deq.ready := collectFire
+
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.collect.valid := collectFire && tileMetaQ.io.deq.bits.slotIdx === idx.U
+    slot.io.collect.bits := collectPayload
+    drainArb.io.in(idx) <> slot.io.drain
   }
-  io.out_v.bits.wvd_mask.foreach(_ := true.B)
+
   when(io.in.fire) {
     perfMmaIssueCount := perfMmaIssueCount + 1.U
   }
-  when(state =/= sIdle) {
+  when(VecInit(slots.map(_.io.active)).asUInt.orR) {
     perfMmaBusyCycles := perfMmaBusyCycles + 1.U
   }
-
-  val flatElemsPerReg = Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, 32.U, 64.U)
-  val totalElems = mDim * nDim
-  def compactElem(idx: UInt): UInt = {
-    val row = Mux(nDim === 16.U, (idx >> 4)(3, 0), (idx >> 3)(3, 0))
-    val col = Mux(nDim === 16.U, idx(3, 0), Cat(0.U(1.W), idx(2, 0)))
-    resultTile(row)(col)
-  }
-  for (lane <- 0 until num_thread) {
-    val baseIdx = drainIdx * flatElemsPerReg + Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U, lane.U, (lane * 2).U)
-    val nextIdx = baseIdx + 1.U
-    val baseValid = baseIdx < totalElems
-    val nextValid = nextIdx < totalElems
-    val fp32Val = Mux(baseValid, compactElem(baseIdx), 0.U)
-    val fp16Lo = Mux(baseValid, compactElem(baseIdx)(15, 0), 0.U(16.W))
-    val fp16Hi = Mux(nextValid, compactElem(nextIdx)(15, 0), 0.U(16.W))
-    io.out_v.bits.wb_wvd_rd(lane) := Mux(dataBuffer.bits.ctrl.mma_cdtype === MMAConst.CDTypeFP32.U,
-      fp32Val,
-      Cat(fp16Hi, fp16Lo))
+  when(issueFire && selectedIssue.lastTile) {
+    currentIssueSlot := Mux(selectedIssueIdx === 0.U, 1.U, 0.U)
+  }.elsewhen(!selectedIssueValid) {
+    currentIssueSlot := Mux(currentIssueSlot === 0.U, 1.U, 0.U)
   }
 
-  switch(state) {
-    is(sIdle) {
-      when(dataBuffer.valid) {
-        rowBase := 0.U
-        colBase := 0.U
-        drainIdx := 0.U
-        resultTile := 0.U.asTypeOf(resultTile)
-        state := sIssue
-      }
-    }
-    is(sIssue) {
-      dotArray.io.in.valid := dataBuffer.valid
-      when(dotArray.io.in.fire) {
-        state := sWait
-      }
-    }
-    is(sWait) {
-      dotArray.io.out.ready := true.B
-      when(dotArray.io.out.fire) {
-        for (r <- 0 until arrayM) {
-          for (c <- 0 until arrayN) {
-            when((rowBase + r.U) < mDim && (colBase + c.U) < nDim) {
-              resultTile((rowBase + r.U)(3, 0))((colBase + c.U)(3, 0)) := dotArray.io.out.bits.result(r * arrayN + c)
-            }
-          }
-        }
-        val nextRow = rowBase + arrayM.U
-        val nextCol = Mux(nextRow >= mDim, colBase + arrayN.U, colBase)
-        rowBase := Mux(nextRow >= mDim, 0.U, nextRow)
-        colBase := nextCol
-        when(nextCol >= nDim) {
-          state := sDrain
-        }.otherwise {
-          state := sIssue
-        }
-      }
-    }
-    is(sDrain) {
-      io.out_v.valid := true.B
-      when(io.out_v.fire) {
-        when(drainIdx + 1.U >= cdRegs) {
-          state := sIdle
-          dataBuffer.ready := true.B
-        }.otherwise {
-          drainIdx := drainIdx + 1.U
-        }
-      }
-    }
-  }
+  io.out_v <> drainArb.io.out
   io.perf_mma_issue_count := perfMmaIssueCount
   io.perf_mma_busy_cycles := perfMmaBusyCycles
 }

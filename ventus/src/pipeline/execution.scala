@@ -1017,6 +1017,110 @@ class SFUexe extends Module{
   io.out_x<>result_x.io.deq
 }
 
+class UNFUSlotIssue extends Bundle {
+  val laneData = Vec(num_sfu, UInt(xLen.W))
+  val laneMask = Vec(num_sfu, Bool())
+  val grpIdx = UInt(log2Ceil(num_thread / num_sfu).W)
+  val op = UInt(4.W)
+  val mode = UInt(2.W)
+  val lastGroup = Bool()
+}
+
+class UNFUSlotCollect extends Bundle {
+  val grpIdx = UInt(log2Ceil(num_thread / num_sfu).W)
+  val laneMask = Vec(num_sfu, Bool())
+  val results = Vec(num_sfu, UInt(xLen.W))
+}
+
+class UNFUSlot extends Module {
+  private val numGrp = num_thread / num_sfu
+  val io = IO(new Bundle {
+    val alloc = Flipped(DecoupledIO(new vExeData()))
+    val issue = DecoupledIO(new UNFUSlotIssue)
+    val collect = Flipped(ValidIO(new UNFUSlotCollect))
+    val drain = DecoupledIO(new WriteVecCtrl)
+    val active = Output(Bool())
+  })
+
+  def groupMaskFrom(mask: Vec[Bool]): UInt = VecInit.tabulate(numGrp) { i =>
+    VecInit(mask.slice(i * num_sfu, i * num_sfu + num_sfu)).asUInt.orR
+  }.asUInt
+
+  val validReg = RegInit(false.B)
+  val in2Reg = Reg(Vec(num_thread, UInt(xLen.W)))
+  val maskReg = Reg(Vec(num_thread, Bool()))
+  val ctrlReg = Reg(new CtrlSigs())
+  val outDataReg = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
+  val issueMaskReg = RegInit(0.U(numGrp.W))
+  val collectPendingReg = RegInit(0.U(log2Ceil(numGrp + 1).W))
+  val doneReg = RegInit(false.B)
+
+  val grpIdx = PriorityEncoder(issueMaskReg)
+  val grpOH = UIntToOH(grpIdx, numGrp).asUInt
+
+  io.alloc.ready := !validReg
+  io.issue.valid := validReg && issueMaskReg.orR
+  io.issue.bits.op := ctrlReg.unfu_op
+  io.issue.bits.mode := ctrlReg.unfu_mode
+  io.issue.bits.grpIdx := grpIdx
+  io.issue.bits.lastGroup := PopCount(issueMaskReg) === 1.U
+  io.issue.bits.laneData := 0.U.asTypeOf(io.issue.bits.laneData)
+  io.issue.bits.laneMask := 0.U.asTypeOf(io.issue.bits.laneMask)
+  for (i <- 0 until numGrp) {
+    when(i.U === grpIdx) {
+      io.issue.bits.laneData := VecInit(in2Reg.slice(i * num_sfu, i * num_sfu + num_sfu))
+      io.issue.bits.laneMask := VecInit(maskReg.slice(i * num_sfu, i * num_sfu + num_sfu))
+    }
+  }
+
+  io.drain.valid := validReg && doneReg
+  io.drain.bits.wvd_mask := maskReg
+  io.drain.bits.wvd := ctrlReg.wvd
+  io.drain.bits.wb_wvd_rd := outDataReg
+  io.drain.bits.reg_idxw := ctrlReg.reg_idxw
+  io.drain.bits.warp_id := ctrlReg.wid
+  if (SPIKE_OUTPUT) {
+    io.drain.bits.spike_info.get := ctrlReg.spike_info.get
+  }
+
+  when(io.alloc.fire) {
+    validReg := true.B
+    in2Reg := io.alloc.bits.in2
+    maskReg := io.alloc.bits.mask
+    ctrlReg := io.alloc.bits.ctrl
+    outDataReg := 0.U.asTypeOf(outDataReg)
+    issueMaskReg := groupMaskFrom(io.alloc.bits.mask)
+    collectPendingReg := PopCount(groupMaskFrom(io.alloc.bits.mask))
+    doneReg := !groupMaskFrom(io.alloc.bits.mask).orR
+  }
+  when(io.issue.fire) {
+    issueMaskReg := issueMaskReg & (~grpOH).asUInt
+  }
+  when(io.collect.valid) {
+    for (g <- 0 until numGrp) {
+      when(g.U === io.collect.bits.grpIdx) {
+        for (j <- 0 until num_sfu) {
+          when(io.collect.bits.laneMask(j)) {
+            outDataReg(g * num_sfu + j) := io.collect.bits.results(j)
+          }
+        }
+      }
+    }
+    collectPendingReg := collectPendingReg - 1.U
+    when(collectPendingReg === 1.U) {
+      doneReg := true.B
+    }
+  }
+  when(io.drain.fire) {
+    validReg := false.B
+    issueMaskReg := 0.U
+    collectPendingReg := 0.U
+    doneReg := false.B
+  }
+
+  io.active := validReg
+}
+
 class UNFUexe extends Module{
   val io = IO(new Bundle {
     val in = Flipped(DecoupledIO(new vExeData()))
@@ -1026,121 +1130,95 @@ class UNFUexe extends Module{
     val perf_unfu_busy_cycles = Output(UInt(64.W))
   })
 
+  val maxInflight = 2
+  val slotIdxWidth = scala.math.max(1, log2Ceil(maxInflight))
+  class GroupMeta extends Bundle {
+    val slotIdx = UInt(slotIdxWidth.W)
+    val grpIdx = UInt(log2Ceil(num_thread / num_sfu).W)
+    val laneMask = Vec(num_sfu, Bool())
+  }
+
+  val slots = Seq.fill(maxInflight)(Module(new UNFUSlot))
   val unfu = Seq.fill(num_sfu)(Module(new UNFUModule))
-  val dataBuffer = Queue(io.in, 1)
-  val sIdle :: sBusy :: sFinish :: Nil = Enum(3)
-  val state = RegInit(sIdle)
-  val issueValid = RegInit(false.B)
-  val mask = RegInit(0.U(num_thread.W))
-  val outData = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
+  val issuedGroups = Module(new Queue(new GroupMeta, maxInflight * (num_thread / num_sfu), pipe = true))
+  val drainArb = Module(new RRArbiter(new WriteVecCtrl, maxInflight))
   val perfUnfuIssueCount = RegInit(0.U(64.W))
   val perfUnfuBusyCycles = RegInit(0.U(64.W))
+  val currentIssueSlot = RegInit(0.U(slotIdxWidth.W))
 
-  val numGrp = num_thread / num_sfu
-  val maskGrp = Wire(Vec(numGrp, Bool()))
-  maskGrp.zipWithIndex.foreach { case (grpMask, idx) =>
-    grpMask := mask(idx * num_sfu + num_sfu - 1, idx * num_sfu).orR
+  val allocReadyVec = VecInit(slots.map(_.io.alloc.ready)).asUInt
+  val allocIdx = PriorityEncoder(allocReadyVec)
+  io.in.ready := allocReadyVec.orR
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.alloc.valid := io.in.valid && allocReadyVec.orR && allocIdx === idx.U
+    slot.io.alloc.bits := io.in.bits
   }
-  val grpIdx = PriorityEncoder(maskGrp)
-  val laneData = WireInit(VecInit(Seq.fill(num_sfu)(0.U(xLen.W))))
-  val laneMask = WireInit(VecInit(Seq.fill(num_sfu)(false.B)))
-  for (i <- 0 until numGrp) {
-    when(i.U === grpIdx) {
-      laneData := VecInit(dataBuffer.bits.in2.slice(i * num_sfu, i * num_sfu + num_sfu))
-      laneMask := mask(i * num_sfu + num_sfu - 1, i * num_sfu).asBools
-    }
-  }
+
+  val issueValidVec = VecInit(slots.map(_.io.issue.valid)).asUInt
+  val currentIssueOH = UIntToOH(currentIssueSlot, maxInflight).asUInt
+  val selectedIssueOH = Mux((issueValidVec & currentIssueOH).orR, currentIssueOH, PriorityEncoderOH(issueValidVec))
+  val selectedIssueValid = selectedIssueOH.orR
+  val selectedIssue = Mux1H(selectedIssueOH, slots.map(_.io.issue.bits))
+  val selectedIssueIdx = OHToUInt(selectedIssueOH)
 
   val laneInReady = Wire(Vec(num_sfu, Bool()))
   val laneOutValid = Wire(Vec(num_sfu, Bool()))
+  val collectLaneMask = issuedGroups.io.deq.bits.laneMask
   for (i <- 0 until num_sfu) {
-    unfu(i).io.in.bits.x := laneData(i)
-    unfu(i).io.in.bits.op := dataBuffer.bits.ctrl.unfu_op
-    unfu(i).io.in.bits.mode := dataBuffer.bits.ctrl.unfu_mode
-    laneInReady(i) := !laneMask(i) || unfu(i).io.in.ready
-    laneOutValid(i) := !laneMask(i) || unfu(i).io.out.valid
+    unfu(i).io.in.bits.x := selectedIssue.laneData(i)
+    unfu(i).io.in.bits.op := selectedIssue.op
+    unfu(i).io.in.bits.mode := selectedIssue.mode
+    laneInReady(i) := !selectedIssue.laneMask(i) || unfu(i).io.in.ready
+    laneOutValid(i) := !collectLaneMask(i) || unfu(i).io.out.valid
     unfu(i).io.in.valid := false.B
     unfu(i).io.out.ready := false.B
   }
+  val issueFire = selectedIssueValid && laneInReady.asUInt.andR && issuedGroups.io.enq.ready
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.issue.ready := issueFire && selectedIssueIdx === idx.U
+  }
+  issuedGroups.io.enq.valid := issueFire
+  issuedGroups.io.enq.bits.slotIdx := selectedIssueIdx
+  issuedGroups.io.enq.bits.grpIdx := selectedIssue.grpIdx
+  issuedGroups.io.enq.bits.laneMask := selectedIssue.laneMask
+  for (i <- 0 until num_sfu) {
+    unfu(i).io.in.valid := issueFire && selectedIssue.laneMask(i)
+  }
 
-  val allInReady = laneInReady.asUInt.andR
-  val allOutValid = laneOutValid.asUInt.andR
-  val issueFire = state === sBusy && issueValid && allInReady
-  val collectFire = state === sBusy && !issueValid && allOutValid
+  val collectFire = issuedGroups.io.deq.valid && laneOutValid.asUInt.andR
+  issuedGroups.io.deq.ready := collectFire
+  val collectPayload = Wire(new UNFUSlotCollect)
+  collectPayload.grpIdx := issuedGroups.io.deq.bits.grpIdx
+  collectPayload.laneMask := issuedGroups.io.deq.bits.laneMask
+  for (i <- 0 until num_sfu) {
+    collectPayload.results(i) := unfu(i).io.out.bits.result
+    unfu(i).io.out.ready := collectFire && collectLaneMask(i)
+  }
+  slots.zipWithIndex.foreach { case (slot, idx) =>
+    slot.io.collect.valid := collectFire && issuedGroups.io.deq.bits.slotIdx === idx.U
+    slot.io.collect.bits := collectPayload
+    drainArb.io.in(idx) <> slot.io.drain
+  }
+
   when(io.in.fire) {
     perfUnfuIssueCount := perfUnfuIssueCount + 1.U
   }
-  when(state =/= sIdle) {
+  when(VecInit(slots.map(_.io.active)).asUInt.orR) {
     perfUnfuBusyCycles := perfUnfuBusyCycles + 1.U
   }
-
-  for (i <- 0 until num_sfu) {
-    unfu(i).io.in.valid := issueFire && laneMask(i)
-    unfu(i).io.out.ready := collectFire && laneMask(i)
+  when(issueFire && selectedIssue.lastGroup) {
+    currentIssueSlot := Mux(selectedIssueIdx === 0.U, 1.U, 0.U)
+  }.elsewhen(!selectedIssueValid) {
+    currentIssueSlot := Mux(currentIssueSlot === 0.U, 1.U, 0.U)
   }
-
-  dataBuffer.ready := state === sFinish && io.out_v.ready
 
   io.out_x.valid := false.B
   io.out_x.bits := 0.U.asTypeOf(new WriteScalarCtrl)
-
-  io.out_v.bits.wvd_mask := dataBuffer.bits.mask
-  io.out_v.bits.wvd := dataBuffer.bits.ctrl.wvd
-  io.out_v.bits.wb_wvd_rd := outData
-  io.out_v.bits.reg_idxw := dataBuffer.bits.ctrl.reg_idxw
-  io.out_v.bits.warp_id := dataBuffer.bits.ctrl.wid
   if (SPIKE_OUTPUT) {
-    io.out_v.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
-    io.out_x.bits.spike_info.get := dataBuffer.bits.ctrl.spike_info.get
+    io.out_x.bits.spike_info.get := 0.U.asTypeOf(new InstWriteBack)
   }
-  io.out_v.valid := state === sFinish
+  io.out_v <> drainArb.io.out
 
-  switch(state) {
-    is(sIdle) {
-      when(io.in.fire) {
-        mask := io.in.bits.mask.asUInt
-        when(io.in.bits.mask.asUInt.orR) {
-          state := sBusy
-          issueValid := true.B
-        }.otherwise {
-          state := sFinish
-          issueValid := false.B
-        }
-      }
-    }
-    is(sBusy) {
-      when(issueFire) {
-        issueValid := false.B
-      }
-      when(collectFire) {
-        for (i <- 0 until numGrp) {
-          when(i.U === grpIdx) {
-            val issuedMask = (laneMask.asUInt << (i * num_sfu)).pad(num_thread)
-            val nextMask = mask & (~issuedMask).asUInt
-            mask := nextMask
-            for (j <- 0 until num_sfu) {
-              when(laneMask(j)) {
-                outData(i * num_sfu + j) := unfu(j).io.out.bits.result
-              }
-            }
-            when(nextMask.orR) {
-              issueValid := true.B
-            }.otherwise {
-              state := sFinish
-            }
-          }
-        }
-      }
-    }
-    is(sFinish) {
-      when(io.out_v.ready) {
-        state := sIdle
-        issueValid := false.B
-        mask := 0.U
-        outData := 0.U.asTypeOf(outData)
-      }
-    }
-  }
   io.perf_unfu_issue_count := perfUnfuIssueCount
   io.perf_unfu_busy_cycles := perfUnfuBusyCycles
 }

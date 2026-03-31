@@ -215,6 +215,53 @@ class UNFUExecutionTest extends AnyFreeSpec with ChiselScalatestTester {
       }
     }
   }
+
+  "keep unfu group issue close to II=1 instead of waiting full pipeline latency between groups" in {
+    test(new UNFUexe) { dut =>
+      def measureLatency(maskFn: Int => Boolean, regIdx: Int): Int = {
+        dut.io.out_v.ready.poke(true.B)
+        dut.io.out_x.ready.poke(false.B)
+        while (!dut.io.in.ready.peek().litToBoolean) {
+          dut.clock.step()
+        }
+        dut.io.in.valid.poke(true.B)
+        dut.io.in.bits.in1.foreach(_.poke(0.U))
+        dut.io.in.bits.in2.foreach(_.poke(0.U))
+        dut.io.in.bits.in3.foreach(_.poke(0.U))
+        dut.io.in.bits.mask.zipWithIndex.foreach { case (lane, idx) =>
+          lane.poke(maskFn(idx).B)
+        }
+        dut.io.in.bits.ctrl.unfu.poke(true.B)
+        dut.io.in.bits.ctrl.unfu_op.poke(0.U)
+        dut.io.in.bits.ctrl.unfu_mode.poke(0.U)
+        dut.io.in.bits.ctrl.isvec.poke(true.B)
+        dut.io.in.bits.ctrl.wvd.poke(true.B)
+        dut.io.in.bits.ctrl.reg_idxw.poke(regIdx.U)
+        dut.io.in.bits.ctrl.wid.poke(0.U)
+        dut.clock.step()
+        dut.io.in.valid.poke(false.B)
+
+        var cycles = 0
+        while (!dut.io.out_v.valid.peek().litToBoolean && cycles < 256) {
+          dut.clock.step()
+          cycles += 1
+        }
+        dut.io.out_v.valid.expect(true.B)
+        dut.clock.step()
+        cycles
+      }
+
+      val singleGroupLatency = measureLatency(idx => idx < num_sfu, regIdx = 10)
+      val fullWarpLatency = measureLatency(_ => true, regIdx = 11)
+      val extraCycles = fullWarpLatency - singleGroupLatency
+
+      assert(
+        extraCycles <= (num_thread / num_sfu) + 2,
+        s"UNFU wrapper inserted too many bubbles between groups: single=$singleGroupLatency full=$fullWarpLatency extra=$extraCycles"
+      )
+    }
+  }
+
 }
 
 class UNFUInstructionsTest extends AnyFreeSpec {
